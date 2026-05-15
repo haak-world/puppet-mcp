@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "puppet": {
+      "command": "puppet-mcp",
+      "args": [],
+      "env": {
+        "PUPPET_DATA_DIR": "~/.puppet-mcp",
+        "PUPPET_PROJECT_DIR": "."
+      }
+    }
+  }
+}

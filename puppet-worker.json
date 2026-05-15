@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "puppet": {
+      "command": "puppet-mcp-worker",
+      "args": [],
+      "env": {
+        "PUPPET_DATA_DIR": "~/.puppet-mcp"
+      }
+    }
+  }
+}
