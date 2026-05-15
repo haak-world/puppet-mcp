@@ -43,6 +43,17 @@ def _open_in_zed_terminal(session_name: str):
             delay 0.5
             keystroke "v" using {{command down}}
             keystroke return
+            delay 0.3
+            -- Rename
+            set the clipboard to "{session_name}"
+            keystroke "p" using {{command down, shift down}}
+            delay 0.2
+            keystroke "term renam"
+            delay 0.3
+            keystroke return
+            delay 0.2
+            keystroke "v" using {{command down}}
+            keystroke return
         end tell
     end tell
     '''
