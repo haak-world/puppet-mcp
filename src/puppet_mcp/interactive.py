@@ -38,10 +38,17 @@ def _open_in_zed_terminal(session_name: str):
     tell application "System Events"
         tell process "zed"
             set frontmost to true
-            -- Cmd+Shift+\\ = new terminal (direct keybinding, no command palette)
+            -- Cmd+Shift+\\ = new terminal
             key code 42 using {{command down, shift down}}
             delay 0.4
             -- Paste tmux attach from clipboard
+            keystroke "v" using {{command down}}
+            keystroke return
+            delay 0.3
+            -- Cmd+Shift+R = rename terminal
+            set the clipboard to "{session_name}"
+            keystroke "r" using {{command down, shift down}}
+            delay 0.2
             keystroke "v" using {{command down}}
             keystroke return
         end tell
