@@ -26,6 +26,7 @@ from pathlib import Path
 from .tmux import (
     capture_pane,
     classify_activity,
+    content_lines,
     detect_context_window,
     extract_permission_content,
     list_sessions,
@@ -264,7 +265,30 @@ def diff_and_notify(prev_sessions: dict, curr: dict):
             _dispatch_event(subs, "unblocked", name, f"now {curr_act}")
 
         if curr_act == "idle" and prev_act == "active":
-            _dispatch_event(subs, "completed", name, "was active, now idle")
+            # Ask the agent to self-report rather than mechanically scraping pane
+            try:
+                from .tmux import send_keys as _sk, is_idle as _idle
+                pane = capture_pane(name, 5)
+                if _idle(pane):
+                    _sk(name, "[sentinel]: You just completed a task. Report in one line: what you did, what you produced, and any blockers. Prefix your answer with REPORT:")
+                    # Give the agent time to respond, then capture
+                    import time as _t
+                    _t.sleep(15)
+                    pane = capture_pane(name, 20)
+                    lines = content_lines(pane, 10)
+                    report = ""
+                    for line in lines:
+                        if line.startswith("REPORT:"):
+                            report = line[7:].strip()
+                            break
+                    if not report:
+                        # Fall back to last content line
+                        report = lines[-1] if lines else "done"
+                    _dispatch_event(subs, "completed", name, report)
+                else:
+                    _dispatch_event(subs, "completed", name, "done")
+            except Exception:
+                _dispatch_event(subs, "completed", name, "done")
 
         if curr_act == "stale" and prev_act != "stale":
             _dispatch_event(subs, "stale", name, f"was {prev_act}")
