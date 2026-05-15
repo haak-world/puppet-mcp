@@ -25,40 +25,16 @@ from .tmux import (
 
 
 def _open_in_zed_terminal(session_name: str):
-    """Open a new Zed terminal attached to a tmux session.
+    """Open a terminal attached to a tmux session.
 
-    Uses AppleScript with clipboard paste (instant) instead of
-    keystroke typing (slow, visible). Minimal delays.
+    Uses Terminal.app for speed (~0.1s) rather than Zed's command palette
+    UI automation (~2s). The terminal window title is set to the session name.
     """
     attach_cmd = f"tmux attach -t {session_name}"
-    # Use clipboard for instant paste instead of slow keystroke typing
     script = f'''
-    tell application "System Events"
-        tell process "zed"
-            set frontmost to true
-            -- New terminal via command palette (short fuzzy match)
-            keystroke "p" using {{command down, shift down}}
-            delay 0.2
-            keystroke "new term"
-            delay 0.3
-            keystroke return
-            delay 0.5
-            -- Paste tmux attach command via clipboard (instant, no visible typing)
-            set the clipboard to "{attach_cmd}"
-            keystroke "v" using {{command down}}
-            keystroke return
-            delay 0.2
-            -- Rename terminal
-            keystroke "p" using {{command down, shift down}}
-            delay 0.2
-            keystroke "term renam"
-            delay 0.3
-            keystroke return
-            delay 0.2
-            set the clipboard to "{session_name}"
-            keystroke "v" using {{command down}}
-            keystroke return
-        end tell
+    tell application "Terminal"
+        activate
+        do script "printf '\\033]0;puppet: {session_name}\\007' && {attach_cmd}"
     end tell
     '''
     subprocess.Popen(["osascript", "-e", script],
