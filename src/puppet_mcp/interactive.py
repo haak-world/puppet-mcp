@@ -31,16 +31,16 @@ def _open_in_zed_terminal(session_name: str):
     """
     attach_cmd = f"tmux attach -t {session_name}"
     script = f'''
+    set the clipboard to "{attach_cmd}"
     tell application "System Events"
         tell process "zed"
             set frontmost to true
             keystroke "p" using {{command down, shift down}}
+            delay 0.2
+            keystroke "new term"
             delay 0.3
-            keystroke "workspace: new terminal"
-            delay 0.5
             keystroke return
-            delay 0.8
-            set the clipboard to "{attach_cmd}"
+            delay 0.5
             keystroke "v" using {{command down}}
             keystroke return
         end tell
