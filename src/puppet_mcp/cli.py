@@ -1,21 +1,17 @@
 """puppet — CLI for managing Claude Code sessions via tmux.
 
-Click-based replacement for the bash puppet script. Imports from
-puppet_mcp modules directly rather than shelling out.
+4 commands for humans. 8 MCP tools for agents.
 """
 
 import json
 import os
-import re
 import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 import click
 
-from . import console_url, data_dir, project_dir
-from .compact import mechanical_prune, split_session
+from . import data_dir, project_dir
 from .session import (
     SessionMap,
     discover_all_sessions,
@@ -32,7 +28,6 @@ from .tmux import (
     detect_context_window,
     extract_permission_content,
     has_attached_client,
-    has_claude_process,
     is_idle,
     kill_session,
     list_sessions,
@@ -44,216 +39,181 @@ from .tmux import (
 )
 
 
-def _message_log() -> Path:
-    return data_dir() / "puppet-messages.log"
-
-
 def _session_map() -> SessionMap:
     return SessionMap()
 
 
-def _log_message(text: str):
-    log = _message_log()
+def _log_message(msg: str):
+    log = data_dir() / "puppet-messages.log"
     log.parent.mkdir(parents=True, exist_ok=True)
+    from datetime import datetime, timezone
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     with open(log, "a") as f:
-        f.write(f"{ts} {text}\n")
-
-
-def _try_register_session(name: str, smap: SessionMap, parent: str = "", role: str = "") -> str | None:
-    """Poll PID chain to discover and register session ID after launch."""
-    for _ in range(5):
-        info = get_claude_session_info(name)
-        if info:
-            smap.record(name, info["session_id"], info.get("agent", ""), info.get("cwd", ""), parent=parent, role=role)
-            curl_console = console_url()
-            if curl_console:
-                import subprocess
-                try:
-                    subprocess.run([
-                        "curl", "-sf", "-X", "PUT",
-                        f"{curl_console}/api/sessions/{info['session_id']}/name",
-                        "-H", "Content-Type: application/json",
-                        "-d", json.dumps({"name": name}),
-                    ], capture_output=True, timeout=5)
-                except Exception:
-                    pass
-            return info["session_id"]
-        time.sleep(3)
-    return None
-
-
-def _set_terminal_title(name: str):
-    """Set terminal title via escape sequence."""
-    sys.stdout.write(f"\033]0;puppet: {name}\007")
-    sys.stdout.flush()
+        f.write(f"{ts} {msg}\n")
 
 
 def _attach(name: str):
-    """Set terminal title and exec tmux attach (replaces process)."""
-    _set_terminal_title(name)
+    """Set terminal title and attach to tmux session."""
+    sys.stdout.write(f"\033]0;puppet: {name}\007")
+    sys.stdout.flush()
     os.execlp("tmux", "tmux", "attach", "-t", name)
 
 
-# ── CLI group ────────────────────────────────────────────────────────
-
 @click.group()
 def cli():
-    """puppet — manage Claude Code sessions via tmux."""
+    """puppet — manage Claude Code sessions via tmux.
+
+    \b
+    4 commands:
+      launch NAME   get into a session (create/resume/thaw/attach)
+      send NAME     talk to a session (text, keys, slash commands)
+      manage NAME   lifecycle (kill, freeze, restart, compact, etc.)
+      watch         live interactive dashboard
+    """
 
 
-# ── 1. launch ────────────────────────────────────────────────────────
+# ── launch ──────────────────────────────────────────────────────────
 
 @cli.command()
 @click.argument("name")
 @click.option("--agent", "-a", default="", help="Agent name (default: same as NAME)")
-@click.option("--model", "-m", default="opus", help="Model name")
+@click.option("--model", "-m", default="opus")
 @click.option("--context", default="", help="Context window, e.g. 1m")
 @click.option("--role", "-r", default="worker", type=click.Choice(["worker", "orchestrator"]))
 @click.option("--resume", default="", help="Resume session by ID")
-@click.option("--budget", "-b", default=5.0, help="Max spend in USD")
+@click.option("--budget", "-b", default=5.0)
 @click.option("--cwd", "-d", default="", help="Working directory")
 @click.option("--prompt", "-p", default="", help="Initial prompt")
 @click.option("--new", "force_new", is_flag=True, help="Force fresh session (ignore frozen)")
-@click.option("--unsafe", is_flag=True, help="Skip permission prompts")
-@click.option("--detach", is_flag=True, help="Don't attach — leave running in background")
+@click.option("--unsafe", is_flag=True)
+@click.option("--detach", is_flag=True, help="Don't attach after launching")
 def launch(name, agent, model, context, role, resume, budget, cwd, prompt, force_new, unsafe, detach):
-    """Launch, resume, or attach to a session."""
-    smap = _session_map()
-    agent = agent or name
-    cwd = cwd or project_dir()
+    """Get into a session — create, resume, thaw, or attach.
 
-    # If tmux session already exists, just attach
+    If NAME matches an existing tmux session, attaches to it.
+    If a frozen session exists for NAME, thaws and resumes it.
+    Otherwise searches for resumable sessions matching NAME.
+    """
+    agent = agent or name
+    cwd = cwd or os.getcwd()
+    smap = _session_map()
+
+    # Active tmux session → attach
     if session_exists(name):
         click.echo(f"Session '{name}' exists. Attaching...")
         _attach(name)
         return
 
-    # Check for frozen session -> thaw it (unless --new)
+    # Frozen → thaw
     if not force_new and not resume:
-        entry = smap.get(name)
-        if entry and entry.get("status") == "frozen":
-            frozen_sid = entry.get("session_id", "")
-            if frozen_sid:
-                click.echo(f"Thawing frozen session '{name}' (session={frozen_sid})...")
-                resume = frozen_sid
-                frozen_agent = entry.get("agent", "")
-                if frozen_agent:
-                    agent = frozen_agent
+        frozen_entry = smap.get(name)
+        if frozen_entry and frozen_entry.get("status") == "frozen":
+            resume = frozen_entry["session_id"]
+            agent = frozen_entry.get("agent") or agent
+            click.echo(f"Thawing frozen session '{name}'...")
 
-    # If no --resume, search for resumable sessions
-    if not resume and agent == name:
+    # Search for resumable sessions
+    if not force_new and not resume:
         sessions = discover_all_sessions(hours=72)
         q = name.lower()
-        hits = [
-            s for s in sessions
-            if q in (s.get("agent") or "").lower()
-            or q in (s.get("topic") or "").lower()
-            or q in (s.get("session_id") or "").lower()
-            or q in (s.get("cwd") or "").lower()
-        ]
+        hits = [s for s in sessions if
+                q in (s.get("agent") or "").lower()
+                or q in (s.get("topic") or "").lower()
+                or q in (s.get("session_id") or "").lower()]
         if hits:
             click.echo(f"Found existing sessions matching '{name}':")
             for i, s in enumerate(hits[:8]):
-                s_agent = s.get("agent") or "?"
-                sid = s.get("session_id", "?")
+                ag = s.get("agent") or "?"
+                sid = s.get("session_id", "")
                 ex = s.get("exchanges", "?")
                 sz = s.get("size_mb", "?")
                 run = "running" if s.get("is_running") else "stopped"
-                topic = (s.get("topic") or "")[:60]
-                click.echo(f"  {i + 1}) [{run}] {s_agent} {ex}x {sz}MB sid={sid} -- {topic}")
-            click.echo("")
-            click.echo("  n) Start fresh session")
-            click.echo("")
+                topic = (s.get("topic") or "")[:50]
+                click.echo(f"  {i+1}) [{run}] {ag} {ex}x {sz}MB sid={sid} — {topic}")
+            click.echo(f"\n  n) Start fresh session\n")
             choice = click.prompt("Resume which?", default="n")
-            if choice.lower() != "n":
-                try:
-                    idx = int(choice) - 1
-                    if 0 <= idx < len(hits[:8]):
-                        chosen = hits[idx]
-                        resume = chosen.get("session_id", "")
-                        found_agent = chosen.get("agent", "")
-                        if found_agent:
-                            agent = found_agent
-                        click.echo(f"Resuming session {resume[:12]}...")
-                except (ValueError, IndexError):
-                    pass
+            if choice != "n" and choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(hits):
+                    resume = hits[idx]["session_id"]
+                    found_agent = hits[idx].get("agent")
+                    if found_agent:
+                        agent = found_agent
 
-    # Build the claude command
+    # Build claude command
     if resume:
-        if cwd == project_dir():
-            cwd = resolve_session_cwd(resume, smap, default=project_dir())
-        claude_cmd = f"cd {cwd} && claude --resume {resume}"
-        click.echo(f"Launching '{name}': resuming session {resume[:12]}... (cwd: {cwd})")
-    elif agent:
+        session_cwd = resolve_session_cwd(resume, smap, default=cwd)
+        claude_cmd = f"cd {session_cwd} && claude --resume {resume}"
+        click.echo(f"Resuming session {resume[:12]}…")
+    else:
         model_str = f"{model}[{context}]" if context else model
         claude_cmd = f"cd {cwd} && claude --agent {agent} --model {model_str} --max-budget-usd {budget}"
         if unsafe:
             claude_cmd += " --dangerously-skip-permissions"
-        click.echo(f"Launching '{name}': agent={agent}, model={model_str}, role={role}, budget=${budget}")
-    else:
-        click.echo("Error: provide either agent or resume.", err=True)
-        raise SystemExit(1)
+        click.echo(f"Launching '{name}': agent={agent}, model={model_str}, role={role}")
 
-    # Orchestrator role gets puppet MCP config
+    # Orchestrator gets full puppet tools
     if role == "orchestrator":
         pkg_dir = Path(__file__).resolve().parent.parent.parent
         orch_config = pkg_dir / "puppet-orchestrator.json"
         if orch_config.exists():
             claude_cmd += f" --mcp-config {orch_config}"
 
-    # Create tmux session
-    result = create_session(name)
-    if result.returncode != 0:
-        click.echo(f"Error creating tmux session: {result.stderr.strip()}", err=True)
-        raise SystemExit(1)
+    # Create tmux session with shell, send claude command
+    create_session(name)
     time.sleep(0.5)
     send_keys(name, claude_cmd)
 
-    # If resuming, register and attach
     if resume:
         smap.record(name, resume, agent, cwd, role=role)
-        if not detach:
-            _attach(name)
-        else:
-            click.echo(f"Session '{name}' running (detached). Attach with: puppet attach {name}")
-        return
-
-    click.echo("Waiting for Claude to initialize...")
-    time.sleep(12)
-
-    if prompt:
-        send_keys(name, prompt)
-        click.echo("Prompt sent.")
-
-    session_id = _try_register_session(name, smap, role=role)
-    if session_id:
-        click.echo(f"Registered: session={session_id}")
-
-    if not detach:
-        _attach(name)
     else:
-        click.echo(f"Session '{name}' running (detached). Attach with: puppet attach {name}")
+        # Wait for claude to start, register session ID
+        time.sleep(12)
+        if prompt:
+            send_keys(name, prompt)
+        for _ in range(5):
+            info = get_claude_session_info(name)
+            if info:
+                smap.record(name, info["session_id"], info.get("agent", ""), info.get("cwd", ""), role=role)
+                break
+            time.sleep(3)
+
+    if detach:
+        click.echo(f"Session '{name}' running (detached).")
+    else:
+        _attach(name)
 
 
-# ── 2. send ──────────────────────────────────────────────────────────
+# ── send ────────────────────────────────────────────────────────────
 
 @cli.command()
 @click.argument("name")
-@click.argument("text", nargs=-1)
-@click.option("--action", default="text", type=click.Choice(["text", "enter", "escape", "ctrl-c", "slash"]))
-@click.option("--from", "from_agent", default="", help="Caller identity for text action")
-def send(name, text, action, from_agent):
-    """Send input to a session."""
+@click.argument("text", default="")
+@click.option("--action", type=click.Choice(["text", "enter", "escape", "ctrl-c", "slash"]), default="text",
+              help="Input type")
+@click.option("--from", "from_agent", default="", help="Caller identity for message prefix")
+@click.option("--wait", is_flag=True, help="Wait for response (like handoff)")
+@click.option("--timeout", default=120, help="Timeout in seconds when --wait is used")
+def send(name, text, action, from_agent, wait, timeout):
+    """Talk to a session — send text, keys, or slash commands.
+
+    \b
+    Actions:
+      text     Send text + Enter (default)
+      enter    Accept a permission prompt
+      escape   Stop generation
+      ctrl-c   Cancel operation
+      slash    Send a slash command (e.g. /model sonnet)
+
+    Use --wait to block until the agent responds (handoff mode).
+    """
     if not session_exists(name):
         click.echo(f"Error: session '{name}' does not exist.", err=True)
         raise SystemExit(1)
 
-    text_str = " ".join(text)
-
     if action == "enter":
         send_key(name, "Enter")
-        click.echo(f"Accepted permission prompt in '{name}'.")
+        click.echo(f"Sent Enter to '{name}'.")
     elif action == "escape":
         send_key(name, "Escape")
         click.echo(f"Sent Escape to '{name}'.")
@@ -261,474 +221,235 @@ def send(name, text, action, from_agent):
         send_key(name, "C-c")
         click.echo(f"Sent Ctrl+C to '{name}'.")
     elif action == "slash":
-        if not text_str:
-            click.echo("Error: text required for slash action.", err=True)
-            raise SystemExit(1)
-        cmd = text_str if text_str.startswith("/") else f"/{text_str}"
+        cmd = text if text.startswith("/") else f"/{text}"
         send_keys(name, cmd)
         click.echo(f"Sent '{cmd}' to '{name}'.")
     else:
-        if not text_str:
-            click.echo("Error: text required for send.", err=True)
+        if not text:
+            click.echo("Error: text is required for action=text.", err=True)
             raise SystemExit(1)
+        msg = f"[{from_agent}→{name}]: {text}" if from_agent else text
+        send_keys(name, msg)
         if from_agent:
-            send_keys(name, f"[{from_agent}→{name}]: {text_str}")
-            _log_message(f"{from_agent}→{name}: {text_str}")
-        else:
-            send_keys(name, text_str)
+            _log_message(f"{from_agent}→{name}: {text}")
+
+        if wait:
+            # Handoff mode: wait for response
+            elapsed = 0
+            before = set(content_lines(capture_pane(name, 50), 50))
+            time.sleep(2)
+            elapsed += 2
+            while elapsed < timeout:
+                pane = capture_pane(name, 50)
+                if is_idle(pane):
+                    after = content_lines(pane, 50)
+                    new = [l for l in after if l not in before]
+                    if new and (text in new[0] or (from_agent and from_agent in new[0])):
+                        new = new[1:]
+                    click.echo("\n".join(new) if new else "(empty response)")
+                    return
+                time.sleep(2)
+                elapsed += 2
+            click.echo(f"[timeout after {timeout}s]", err=True)
+            return
+
         click.echo(f"Sent to '{name}'.")
 
 
-# ── 3. handoff ───────────────────────────────────────────────────────
-
-@cli.command()
-@click.argument("name")
-@click.argument("prompt")
-@click.option("--timeout", default=120, help="Max seconds to wait")
-@click.option("--from", "from_agent", default="", help="Caller identity")
-def handoff(name, prompt, timeout, from_agent):
-    """Send a prompt and wait for the response."""
-    if not session_exists(name):
-        click.echo(f"Error: session '{name}' does not exist.", err=True)
-        raise SystemExit(1)
-
-    # Wait for idle
-    wait_budget = timeout // 2
-    elapsed = 0
-    while not is_idle(capture_pane(name, 5)) and elapsed < wait_budget:
-        time.sleep(2)
-        elapsed += 2
-    if not is_idle(capture_pane(name, 5)):
-        click.echo(f"Error: '{name}' still working after {elapsed}s.", err=True)
-        raise SystemExit(1)
-
-    before = set(content_lines(capture_pane(name, 50), 50))
-
-    msg = f"[{from_agent}→{name}]: {prompt}" if from_agent else prompt
-    send_keys(name, msg)
-
-    time.sleep(2)
-    elapsed = 2
-    while elapsed < timeout:
-        pane = capture_pane(name, 50)
-        if is_idle(pane):
-            after = content_lines(pane, 50)
-            new_lines = [line for line in after if line not in before]
-            if new_lines and (prompt in new_lines[0] or (from_agent and from_agent in new_lines[0])):
-                new_lines = new_lines[1:]
-            response = "\n".join(new_lines)
-            click.echo(response if response else "(empty response)")
-            return
-        time.sleep(2)
-        elapsed += 2
-
-    pane = capture_pane(name, 50)
-    after = content_lines(pane, 50)
-    new_lines = [line for line in after if line not in before]
-    if new_lines and (prompt in new_lines[0] or (from_agent and from_agent in new_lines[0])):
-        new_lines = new_lines[1:]
-    response = "\n".join(new_lines)
-    click.echo(f"[timeout after {timeout}s — partial response]", err=True)
-    click.echo(response)
-    raise SystemExit(1)
-
-
-# ── 4. status ────────────────────────────────────────────────────────
-
-@cli.command()
-@click.option("--full", is_flag=True, help="Full snapshot of all sessions")
-@click.option("--name", default="", help="Detailed status of one session")
-def status(full, name):
-    """Status of sessions — diffs, full snapshot, or single-session detail."""
-    from .server import puppet_status
-    click.echo(puppet_status(full=full, name=name))
-
-
-# ── 5. read ──────────────────────────────────────────────────────────
-
-@cli.command()
-@click.argument("name")
-@click.option("--lines", "-n", default=30, help="Number of lines to capture")
-def read(name, lines):
-    """Read the last N lines from a session's pane."""
-    if not session_exists(name):
-        click.echo(f"Error: session '{name}' does not exist.", err=True)
-        raise SystemExit(1)
-    output = capture_pane(name, lines)
-    click.echo(output if output else "(empty pane)")
-
-
-# ── 6. find ──────────────────────────────────────────────────────────
-
-@cli.command()
-@click.argument("query", default="")
-@click.option("--scope", default="", help="Restrict to sessions in this directory tree ('.' = cwd)")
-@click.option("--grep", default="", help="Search transcript content")
-@click.option("--hours", default=24, help="How far back to look (0 = no limit)")
-def find(query, scope, grep, hours):
-    """Search ALL Claude Code sessions."""
-    sessions = discover_all_sessions(hours=hours, scope=scope, grep=grep)
-    if query:
-        q = query.lower()
-        sessions = [
-            s for s in sessions
-            if q in (s.get("agent") or "").lower()
-            or q in (s.get("cwd") or "").lower()
-            or q in (s.get("model") or "").lower()
-            or q in (s.get("topic") or "").lower()
-        ]
-    if not sessions:
-        what = f" matching '{grep or query}'" if (grep or query) else ""
-        where = f" in {scope}" if scope else ""
-        click.echo(f"No sessions found{what}{where}.")
-        return
-
-    for s in sessions:
-        agent = s.get("agent") or "?"
-        sid = s.get("session_id", "?")
-        exchanges = s.get("exchanges", "?")
-        size = s.get("size_mb", "?")
-        running = "running" if s.get("is_running") else "stopped"
-        model = (s.get("model") or "?").replace("claude-", "")
-        topic = s.get("topic", "")
-        cwd_path = s.get("cwd", "")
-        cwd_short = cwd_path.rstrip("/").rsplit("/", 1)[-1] if cwd_path else ""
-        topic_str = f" — {topic}" if topic else ""
-        cwd_str = f" [{cwd_short}]" if cwd_short else ""
-        click.echo(f"[{running}] {agent} ({model}) sid={sid} {exchanges}x {size}MB{cwd_str}{topic_str}")
-
-
-# ── 7. manage ────────────────────────────────────────────────────────
+# ── manage ──────────────────────────────────────────────────────────
 
 @cli.command()
 @click.argument("name", default="")
-@click.option("--action", required=True, type=click.Choice(["kill", "freeze", "restart", "compact", "split", "accept_all"]))
-@click.option("--force", is_flag=True, help="Override safety checks")
-@click.option("--topics", multiple=True, help="Topic labels for split action")
-@click.option("--summary", default="", help="Summary note for compact action")
-def manage(name, action, force, topics, summary):
-    """Lifecycle operations for sessions."""
+@click.option("--action", "-a", required=True,
+              type=click.Choice(["kill", "freeze", "restart", "compact", "split", "accept-all",
+                                 "adopt", "role", "cost", "log"]),
+              help="Operation to perform")
+@click.option("--force", is_flag=True)
+@click.option("--topics", multiple=True, help="Topics for split")
+@click.option("--summary", default="", help="Summary for compact")
+@click.option("--value", default="", help="Value for role (worker/orchestrator)")
+@click.option("--lines", "-n", default=50, help="Lines for log")
+def manage(name, action, force, topics, summary, value, lines):
+    """Lifecycle and admin operations.
+
+    \b
+    Actions:
+      kill        Kill session permanently
+      freeze      Stop session, keep restorable
+      restart     Kill + resume with full context
+      compact     Prune session transcript (backs up original)
+      split       Split session by topics (--topics T1 --topics T2)
+      accept-all  Accept all blocked permission prompts
+      adopt       Bring existing session under management
+      role        Set session role (--value worker|orchestrator)
+      cost        Show token counts and costs
+      log         Show message log (--lines N)
+    """
     smap = _session_map()
 
-    if action == "accept_all":
-        names = list_sessions()
-        if not names:
-            click.echo("No tmux sessions running.")
-            return
-        accepted = []
-        for sname in names:
-            pane = capture_pane(sname, 15)
-            info = extract_permission_content(pane)
-            if not info:
-                continue
-            _log_message(f"AUTO-ACCEPT {sname}: {info['tool']} {info['detail']}")
-            send_key(sname, "Enter")
-            accepted.append(f"{sname} ({info['tool']}: {info['detail'][:60]})")
-        if not accepted:
-            click.echo("No sessions blocked on permission prompts.")
-        else:
-            click.echo(f"Accepted {len(accepted)} sessions:")
-            for a in accepted:
-                click.echo(f"  {a}")
-        return
-
-    if not name:
-        click.echo("Error: name is required for this action.", err=True)
-        raise SystemExit(1)
-
     if action == "kill":
+        if not name:
+            click.echo("Error: name required for kill.", err=True); raise SystemExit(1)
         if not session_exists(name):
-            click.echo(f"Error: session '{name}' does not exist.", err=True)
-            raise SystemExit(1)
+            click.echo(f"Error: session '{name}' does not exist.", err=True); raise SystemExit(1)
         if not force and has_attached_client(name):
-            click.echo(f"Warning: a user terminal is attached to '{name}'. Use --force to kill anyway.", err=True)
-            raise SystemExit(1)
-        result = kill_session(name)
-        if result.returncode != 0:
-            click.echo(f"Error killing '{name}': {result.stderr.strip()}", err=True)
-            raise SystemExit(1)
+            click.echo(f"Warning: user attached to '{name}'. Use --force.", err=True); raise SystemExit(1)
+        kill_session(name)
         smap.remove(name)
-        click.echo(f"Killed session '{name}'.")
+        click.echo(f"Killed '{name}'.")
 
     elif action == "freeze":
+        if not name:
+            click.echo("Error: name required for freeze.", err=True); raise SystemExit(1)
         if not session_exists(name):
             entry = smap.get(name)
             if entry and entry.get("status") == "frozen":
-                click.echo(f"'{name}' is already frozen.")
-                return
-            click.echo(f"Error: session '{name}' does not exist.", err=True)
-            raise SystemExit(1)
+                click.echo(f"'{name}' is already frozen."); return
+            click.echo(f"Error: session '{name}' does not exist.", err=True); raise SystemExit(1)
         info = resolve_session_id(name, smap)
         if not info:
-            click.echo(f"Error: could not resolve session ID for '{name}'.", err=True)
-            raise SystemExit(1)
-        result = kill_session(name)
-        if result.returncode != 0:
-            click.echo(f"Error stopping '{name}': {result.stderr.strip()}", err=True)
-            raise SystemExit(1)
+            click.echo(f"Error: could not resolve session ID.", err=True); raise SystemExit(1)
+        kill_session(name)
         smap.freeze(name)
-        click.echo(f"Frozen '{name}': session={info['session_id']}. Use puppet launch to thaw.")
+        click.echo(f"Frozen '{name}'. Use 'puppet launch {name}' to thaw.")
 
     elif action == "restart":
+        if not name:
+            click.echo("Error: name required.", err=True); raise SystemExit(1)
         if not session_exists(name):
-            click.echo(f"Error: session '{name}' does not exist.", err=True)
-            raise SystemExit(1)
+            click.echo(f"Error: session '{name}' does not exist.", err=True); raise SystemExit(1)
         if not force and has_attached_client(name):
-            click.echo(f"Warning: a user terminal is attached to '{name}'. Use --force to restart anyway.", err=True)
-            raise SystemExit(1)
+            click.echo(f"Warning: user attached. Use --force.", err=True); raise SystemExit(1)
         info = resolve_session_id(name, smap)
         if not info:
-            click.echo(f"Error: could not find Claude Code session ID for '{name}'.", err=True)
-            raise SystemExit(1)
-        session_id = info["session_id"]
-        session_cwd = info.get("cwd") or resolve_session_cwd(session_id, smap, default=project_dir())
-        agent = info.get("agent", "")
-
-        kill_result = kill_session(name)
-        if kill_result.returncode != 0:
-            click.echo(f"Error killing '{name}': {kill_result.stderr.strip()}", err=True)
-            raise SystemExit(1)
+            click.echo(f"Error: could not resolve session ID.", err=True); raise SystemExit(1)
+        sid = info["session_id"]
+        session_cwd = info.get("cwd") or resolve_session_cwd(sid, smap, default=os.getcwd())
+        kill_session(name)
         time.sleep(1)
-
-        create_result = create_session(name)
-        if create_result.returncode != 0:
-            click.echo(f"Killed '{name}' but failed to recreate: {create_result.stderr.strip()}. Session ID: {session_id}", err=True)
-            raise SystemExit(1)
+        create_session(name)
         time.sleep(1)
-        send_keys(name, f"cd {session_cwd} && claude --resume {session_id}")
-
-        old_entry = smap.get(name)
-        parent = old_entry.get("parent", "") if old_entry else ""
-        smap.record(name, session_id, agent, session_cwd, parent=parent)
-
-        agent_info = f", agent={agent}" if agent else ""
-        click.echo(f"Restarted '{name}': session={session_id}{agent_info}.")
+        send_keys(name, f"cd {session_cwd} && claude --resume {sid}")
+        old = smap.get(name)
+        smap.record(name, sid, info.get("agent", ""), session_cwd, parent=old.get("parent", "") if old else "")
+        click.echo(f"Restarted '{name}': session={sid}")
 
     elif action == "compact":
+        if not name:
+            click.echo("Error: name required.", err=True); raise SystemExit(1)
+        from .compact import mechanical_prune
         import shutil
-        jsonl_path = find_session_jsonl(name, smap)
-        if jsonl_path is None:
-            click.echo(f"Error: could not find session transcript for '{name}'.", err=True)
-            raise SystemExit(1)
-
+        jsonl = find_session_jsonl(name, smap)
+        if not jsonl:
+            click.echo(f"Error: no transcript for '{name}'.", err=True); raise SystemExit(1)
         entries = []
-        with open(jsonl_path) as f:
+        with open(jsonl) as f:
             for line in f:
                 line = line.strip()
                 if line:
-                    try:
-                        entries.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
-
-        original_size = jsonl_path.stat().st_size
-        original_count = len(entries)
-        pruned = mechanical_prune(entries, keep_resumable=True)
-
-        if summary:
-            insert_at = 0
-            for j, e in enumerate(pruned):
-                if e.get("type") in ("agent-setting", "permission-mode"):
-                    insert_at = j + 1
-                else:
-                    break
-            pruned.insert(insert_at, {
-                "type": "compact-summary",
-                "summary": summary,
-                "compacted_at": datetime.now(timezone.utc).isoformat(),
-                "original_file": str(jsonl_path),
-                "original_entries": original_count,
-            })
-
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        backup_path = jsonl_path.with_suffix(f".pre-compact-{timestamp}.jsonl")
-        shutil.copy2(jsonl_path, backup_path)
-
-        with open(jsonl_path, "w") as f:
-            for entry in pruned:
-                f.write(json.dumps(entry) + "\n")
-
-        compact_size = jsonl_path.stat().st_size
-        reduction = (1 - compact_size / original_size) * 100 if original_size > 0 else 0
-        click.echo(f"Original: {original_count} entries, {original_size:,} bytes")
-        click.echo(f"Compacted: {len(pruned)} entries, {compact_size:,} bytes")
-        click.echo(f"Reduction: {reduction:.1f}%")
-        click.echo(f"Backup: {backup_path}")
-        click.echo(f"File: {jsonl_path}")
+                    try: entries.append(json.loads(line))
+                    except json.JSONDecodeError: pass
+        orig_size = jsonl.stat().st_size
+        pruned = mechanical_prune(entries)
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup = jsonl.with_suffix(f".pre-compact-{ts}.jsonl")
+        shutil.copy2(jsonl, backup)
+        with open(jsonl, "w") as f:
+            for e in pruned:
+                f.write(json.dumps(e) + "\n")
+        new_size = jsonl.stat().st_size
+        pct = (1 - new_size / orig_size) * 100 if orig_size else 0
+        click.echo(f"Compacted: {len(entries)} → {len(pruned)} entries ({pct:.0f}% reduction)")
 
     elif action == "split":
-        if not topics:
-            click.echo("Error: --topics required for split action.", err=True)
-            raise SystemExit(1)
-        jsonl_path = find_session_jsonl(name, smap)
-        if jsonl_path is None:
-            click.echo(f"Error: could not find session transcript for '{name}'.", err=True)
-            raise SystemExit(1)
-        try:
-            results = split_session(jsonl_path, list(topics))
-        except Exception as e:
-            click.echo(f"Error splitting session: {e}", err=True)
-            raise SystemExit(1)
-
+        if not name or not topics:
+            click.echo("Error: name and --topics required.", err=True); raise SystemExit(1)
+        from .compact import split_session
+        jsonl = find_session_jsonl(name, smap)
+        if not jsonl:
+            click.echo(f"Error: no transcript for '{name}'.", err=True); raise SystemExit(1)
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            click.echo("Error: ANTHROPIC_API_KEY required.", err=True); raise SystemExit(1)
+        results = split_session(jsonl, list(topics), api_key)
         for topic, info in sorted(results.items()):
-            if topic == "_suggestions":
-                continue
+            if topic == "_suggestions": continue
             click.echo(f"  {topic}: {info['rounds']} rounds, sid={info['session_id']}")
-            click.echo(f"    {info['path']}")
-        suggestions = results.get("_suggestions", [])
-        if suggestions:
-            click.echo(f"\nSuggested: {', '.join(suggestions)}")
+
+    elif action == "accept-all":
+        for sname in list_sessions():
+            pane = capture_pane(sname, 15)
+            info = extract_permission_content(pane)
+            if info:
+                _log_message(f"AUTO-ACCEPT {sname}: {info['tool']} {info['detail']}")
+                send_key(sname, "Enter")
+                click.echo(f"Accepted: {sname} ({info['tool']})")
+
+    elif action == "adopt":
+        if not name:
+            click.echo("Error: session ID or --tmux name required.", err=True); raise SystemExit(1)
+        if session_exists(name):
+            info = get_claude_session_info(name)
+            if info:
+                smap.record(name, info["session_id"], info.get("agent", ""))
+                click.echo(f"Adopted '{name}': session={info['session_id']}")
+            else:
+                click.echo(f"Error: no claude process in '{name}'.", err=True)
+        else:
+            click.echo(f"Creating tmux session for {name[:12]}…")
+            session_cwd = resolve_session_cwd(name, smap, default=os.getcwd())
+            tmux_name = value or f"puppet-{name[:8]}"
+            create_session(tmux_name)
+            time.sleep(1)
+            send_keys(tmux_name, f"cd {session_cwd} && claude --resume {name}")
+            smap.record(tmux_name, name, "", session_cwd)
+            click.echo(f"Adopted as '{tmux_name}'.")
+
+    elif action == "role":
+        if not name or not value:
+            click.echo("Usage: puppet manage NAME -a role --value worker|orchestrator", err=True); raise SystemExit(1)
+        s = smap.load()
+        if name not in s:
+            click.echo(f"Error: '{name}' not in session map.", err=True); raise SystemExit(1)
+        s[name]["role"] = value
+        smap.save(s)
+        click.echo(f"Set {name} role={value}")
+
+    elif action == "cost":
+        total_tokens = 0
+        total_cost = 0
+        click.echo(f"\n{'Session':<25s} {'Tokens':>12s} {'Est. Cost':>10s}")
+        click.echo(f"{'─'*25} {'─'*12} {'─'*10}")
+        for sname in list_sessions():
+            pane = capture_pane(sname, 5)
+            bar = parse_status_bar(pane)
+            tokens = bar.get("tokens") or 0
+            if tokens:
+                cost_cents = tokens * 11 // 1000
+                total_tokens += tokens
+                total_cost += cost_cents
+                click.echo(f"{sname:<25s} {tokens:>12,} ${cost_cents/100:>9.2f}")
+        click.echo(f"{'─'*25} {'─'*12} {'─'*10}")
+        click.echo(f"{'Total':<25s} {total_tokens:>12,} ${total_cost/100:>9.2f}\n")
+
+    elif action == "log":
+        log_file = data_dir() / "puppet-messages.log"
+        if not log_file.exists():
+            click.echo("No message log yet."); return
+        text = log_file.read_text()
+        for line in text.strip().split("\n")[-lines:]:
+            click.echo(line)
 
 
-# ── attach ───────────────────────────────────────────────────────────
-
-@cli.command()
-@click.argument("name")
-def attach(name):
-    """Attach to a tmux session."""
-    if not session_exists(name):
-        click.echo(f"Error: session '{name}' does not exist.", err=True)
-        raise SystemExit(1)
-    _attach(name)
-
-
-# ── watch ────────────────────────────────────────────────────────────
+# ── watch ───────────────────────────────────────────────────────────
 
 @cli.command()
 @click.option("--interval", default=5, help="Refresh interval in seconds")
 def watch(interval):
-    """Interactive dashboard."""
+    """Live interactive dashboard — arrow keys, Enter to open, f to freeze."""
     from .interactive import watch_interactive
     watch_interactive(interval)
-
-
-# ── freezer ──────────────────────────────────────────────────────────
-
-@cli.command()
-def freezer():
-    """Browse and restore frozen sessions."""
-    from .interactive import freezer as freezer_ui
-    freezer_ui()
-
-
-# ── cost ─────────────────────────────────────────────────────────────
-
-@cli.command()
-def cost():
-    """Token/cost summary across all sessions."""
-    names = list_sessions()
-    if not names:
-        click.echo("No tmux sessions running.")
-        return
-
-    click.echo("")
-    click.echo(f"{'Session':<25s} {'Tokens':>12s} {'Est. Cost':>10s}")
-    click.echo(f"{'─' * 25} {'─' * 12} {'─' * 10}")
-
-    total_tokens = 0
-    total_cost_cents = 0
-
-    for name in sorted(names):
-        pane = capture_pane(name, 15)
-        bar = parse_status_bar(pane)
-        tokens = bar.get("tokens") or 0
-        if tokens == 0:
-            continue
-
-        model = bar.get("model") or ""
-        # Rates: opus ~$30/Mtok, sonnet ~$6/Mtok, haiku ~$0.5/Mtok (blended)
-        rate = 30
-        if "sonnet" in model:
-            rate = 6
-        elif "haiku" in model:
-            rate = 1
-
-        cost_cents = tokens * rate // 10000
-        total_tokens += tokens
-        total_cost_cents += cost_cents
-        cost_str = f"${cost_cents // 100}.{cost_cents % 100:02d}"
-        click.echo(f"{name:<25s} {tokens:>12,d} {cost_str:>10s}")
-
-    click.echo(f"{'─' * 25} {'─' * 12} {'─' * 10}")
-    total_cost_str = f"${total_cost_cents // 100}.{total_cost_cents % 100:02d}"
-    click.echo(f"{'Total':<25s} {total_tokens:>12,d} {total_cost_str:>10s}")
-    click.echo("")
-
-
-# ── log ──────────────────────────────────────────────────────────────
-
-@cli.command()
-@click.argument("n", default=50, type=int)
-def log(n):
-    """Tail message log."""
-    log_file = _message_log()
-    if not log_file.exists():
-        click.echo("No message log yet.")
-        return
-    lines = log_file.read_text().strip().split("\n")
-    for line in lines[-n:]:
-        click.echo(line)
-
-
-# ── role ─────────────────────────────────────────────────────────────
-
-@cli.command()
-@click.argument("name")
-@click.argument("new_role", type=click.Choice(["worker", "orchestrator"]))
-def role(name, new_role):
-    """Set session role."""
-    smap = _session_map()
-    data = smap.load()
-    if name not in data:
-        click.echo(f"Session '{name}' not in map.", err=True)
-        raise SystemExit(1)
-    data[name]["role"] = new_role
-    smap.save(data)
-    click.echo(f"Set {name} role={new_role}")
-
-
-# ── adopt ────────────────────────────────────────────────────────────
-
-@cli.command()
-@click.argument("session_id_or_name")
-@click.option("--tmux", "tmux_mode", is_flag=True, help="Adopt existing tmux session by name")
-@click.option("--name", "alias", default="", help="Name for adopted session")
-def adopt(session_id_or_name, tmux_mode, alias):
-    """Adopt an existing session into puppet management."""
-    smap = _session_map()
-
-    if tmux_mode:
-        name = session_id_or_name
-        if not session_exists(name):
-            click.echo(f"Error: tmux session '{name}' does not exist.", err=True)
-            raise SystemExit(1)
-        info = get_claude_session_info(name)
-        if not info:
-            click.echo(f"Error: no Claude Code process found in '{name}'.", err=True)
-            raise SystemExit(1)
-        smap.record(name, info["session_id"], info.get("agent", ""), info.get("cwd", ""))
-        click.echo(f"Adopted '{name}': session={info['session_id']}, agent={info.get('agent', '?')}")
-    else:
-        sid = session_id_or_name
-        name = alias or f"puppet-{sid[:8]}"
-        # Verify JSONL exists
-        from .session import _find_jsonl_by_sid
-        jsonl = _find_jsonl_by_sid(sid)
-        if not jsonl:
-            click.echo(f"Error: no session transcript found for '{sid}'.", err=True)
-            raise SystemExit(1)
-        if session_exists(name):
-            click.echo(f"Error: tmux session '{name}' already exists.", err=True)
-            raise SystemExit(1)
-        session_cwd = resolve_session_cwd(sid, smap, default=project_dir())
-        result = create_session(name)
-        if result.returncode != 0:
-            click.echo(f"Error creating tmux session: {result.stderr.strip()}", err=True)
-            raise SystemExit(1)
-        time.sleep(1)
-        send_keys(name, f"cd {session_cwd} && claude --resume {sid}")
-        smap.record(name, sid, "", session_cwd)
-        click.echo(f"Adopted session {sid} as '{name}'. Resuming... (cwd: {session_cwd})")
 
 
 if __name__ == "__main__":
