@@ -236,7 +236,7 @@ def resolve_session_cwd(
         project_dirname = p.parent.name
         if project_dirname == "subagents":
             project_dirname = p.parent.parent.name
-        # Decode: -Users-zach-Projects-haak -> /Users/zach/Projects/haak
+        # Decode: -Users-jane-myproject -> /Users/jane/myproject
         # This is ambiguous when path segments contain dashes, so verify
         decoded = "/" + project_dirname.lstrip("-").replace("-", "/")
         if Path(decoded).is_dir():
@@ -249,7 +249,7 @@ def resolve_session_cwd(
 def _cwd_to_project_dir(cwd: str) -> str:
     """Convert a cwd path to Claude Code's project directory name.
 
-    /Users/zach/Projects/haak -> -Users-zach-Projects-haak
+    /Users/jane/myproject -> -Users-jane-myproject
     """
     return cwd.replace("/", "-")
 

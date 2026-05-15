@@ -1,10 +1,11 @@
 """puppet worker MCP server — restricted tool set for non-orchestrator agents.
 
-Tools (4):
-  puppet_send   — all input actions (text, enter, escape, ctrl-c, slash)
-  puppet_status — read-only session status (no heartbeat logging)
-  puppet_read   — raw pane output
-  puppet_find   — search all sessions by metadata/content
+Tools (5):
+  puppet_send     — all input actions (text, enter, escape, ctrl-c, slash)
+  puppet_status   — read-only session status (no heartbeat logging)
+  puppet_read     — raw pane output
+  puppet_find     — search all sessions by metadata/content
+  puppet_sentinel — sentinel events (read-only: poll + status only)
 
 Workers can communicate, observe, and search but cannot launch, kill,
 manage lifecycle, or perform cross-session accept_all.
@@ -15,7 +16,14 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+import json
+import os
+
 from . import data_dir
+from .sentinel import (
+    sentinel_status,
+    poll_subscriber,
+)
 from .session import discover_all_sessions
 from .tmux import (
     capture_pane,
@@ -214,6 +222,89 @@ def puppet_find(
             f"{exchanges}x {size}MB{cwd_str}{topic_str}"
         )
 
+    return "\n".join(lines)
+
+
+# ── puppet_sentinel (read-only) ────────────────────────────────────────
+
+def _resolve_caller_name() -> str:
+    """Auto-resolve caller name: tmux session → settings.json agent → 'default'."""
+    # Try tmux pane ancestry
+    try:
+        from .tmux import run_tmux as _run_tmux
+        import subprocess
+        result = _run_tmux(["list-panes", "-a", "-F", "#{pane_pid} #{session_name}"])
+        if result.returncode == 0 and result.stdout.strip():
+            pane_map = {}
+            for line in result.stdout.strip().split("\n"):
+                parts = line.strip().split(None, 1)
+                if len(parts) == 2:
+                    pane_map[parts[0]] = parts[1]
+            pid = os.getpid()
+            visited = set()
+            while pid and pid > 1 and pid not in visited:
+                visited.add(pid)
+                if str(pid) in pane_map:
+                    return pane_map[str(pid)]
+                try:
+                    r = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+                    pid = int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else 0
+                except (ValueError, subprocess.TimeoutExpired, OSError):
+                    break
+    except Exception:
+        pass
+    proj = os.environ.get("CLAUDE_PROJECT_DIR", "")
+    if proj:
+        from pathlib import Path
+        settings = Path(proj) / ".claude" / "settings.json"
+        if settings.exists():
+            try:
+                agent = json.loads(settings.read_text()).get("agent", "")
+                if agent:
+                    return agent
+            except (json.JSONDecodeError, OSError):
+                pass
+    return "default"
+
+
+@mcp.tool(structured_output=False)
+def puppet_sentinel(action: str = "poll", name: str = "") -> str:
+    """Sentinel events (read-only). Workers can poll their own events and check status.
+
+    Args:
+        action: "poll" (default) or "status"
+        name: subscriber name (auto-resolved if empty)
+    """
+    if action not in ("poll", "status"):
+        return f"Workers can only poll or check status, not {action}."
+
+    if action == "status":
+        info = sentinel_status(name or "")
+        lines = [f"running: {info.get('running', False)}"]
+        if info.get("pid"):
+            lines.append(f"pid: {info['pid']}")
+        subs = info.get("subscribers", {})
+        if subs:
+            lines.append(f"subscribers ({len(subs)}):")
+            for sub_name, sub_info in subs.items():
+                depth = sub_info.get("queue_depth", 0)
+                lines.append(f"  {sub_name}: {depth} queued, interests={sub_info.get('interests', '?')}")
+        return "\n".join(lines)
+
+    # poll
+    name = name or _resolve_caller_name()
+    events = poll_subscriber(name)
+    if not events:
+        return ""
+    lines = []
+    for ev in events:
+        ts = ev.get("time", "")
+        if ts:
+            ts = ts.split("T")[-1][:8]
+        etype = ev.get("type", "?")
+        session = ev.get("session", "?")
+        detail = ev.get("detail", "")
+        lines.append(f"{ts} {etype} {session} — {detail}")
     return "\n".join(lines)
 
 

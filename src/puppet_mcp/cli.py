@@ -1,6 +1,6 @@
 """puppet — CLI for managing Claude Code sessions via tmux.
 
-4 commands for humans. 8 MCP tools for agents.
+5 commands for humans. 8 MCP tools for agents.
 """
 
 import json
@@ -64,11 +64,12 @@ def cli():
     """puppet — manage Claude Code sessions via tmux.
 
     \b
-    4 commands:
-      launch NAME   get into a session (create/resume/thaw/attach)
-      send NAME     talk to a session (text, keys, slash commands)
-      manage NAME   lifecycle (kill, freeze, restart, compact, etc.)
-      watch         live interactive dashboard
+    5 commands:
+      launch NAME    get into a session (create/resume/thaw/attach)
+      send NAME      talk to a session (text, keys, slash commands)
+      manage NAME    lifecycle (kill, freeze, restart, compact, etc.)
+      sentinel ...   sentinel daemon lifecycle and event subscription
+      watch          live interactive dashboard
     """
 
 
@@ -440,6 +441,118 @@ def manage(name, action, force, topics, summary, value, lines):
         text = log_file.read_text()
         for line in text.strip().split("\n")[-lines:]:
             click.echo(line)
+
+
+# ── sentinel ───────────────────────────────────────────────────────
+
+@cli.group()
+def sentinel():
+    """Sentinel daemon lifecycle and event subscription."""
+    pass
+
+
+@sentinel.command()
+def start():
+    """Start the sentinel daemon."""
+    from .sentinel import start_sentinel
+    result = start_sentinel()
+    if result.get("ok"):
+        click.echo(f"Sentinel started (pid={result.get('pid', '?')}).")
+    else:
+        click.echo(f"Error: {result.get('error', 'unknown')}", err=True)
+        raise SystemExit(1)
+
+
+@sentinel.command()
+def stop():
+    """Stop the sentinel daemon."""
+    from .sentinel import stop_sentinel
+    result = stop_sentinel()
+    if result.get("ok"):
+        click.echo("Sentinel stopped.")
+    else:
+        click.echo(f"Error: {result.get('error', 'not running')}", err=True)
+        raise SystemExit(1)
+
+
+@sentinel.command()
+def restart():
+    """Stop + start the sentinel daemon."""
+    from .sentinel import stop_sentinel, start_sentinel
+    stop_sentinel()
+    result = start_sentinel()
+    if result.get("ok"):
+        click.echo(f"Sentinel restarted (pid={result.get('pid', '?')}).")
+    else:
+        click.echo(f"Error: {result.get('error', 'unknown')}", err=True)
+        raise SystemExit(1)
+
+
+@sentinel.command("status")
+@click.argument("name", default="")
+def sentinel_status_cmd(name):
+    """Show sentinel daemon health, subscribers, queue depths."""
+    from .sentinel import sentinel_status
+    info = sentinel_status(name)
+    click.echo(f"running: {info.get('running', False)}")
+    if info.get("pid"):
+        click.echo(f"pid: {info['pid']}")
+    if info.get("uptime"):
+        click.echo(f"uptime: {info['uptime']}")
+    subs = info.get("subscribers", {})
+    if subs:
+        click.echo(f"subscribers ({len(subs)}):")
+        for sub_name, sub_info in subs.items():
+            depth = sub_info.get("queue_depth", 0)
+            click.echo(f"  {sub_name}: {depth} queued, interests={sub_info.get('interests', '?')}")
+
+
+@sentinel.command()
+@click.argument("name")
+@click.option("--interests", "-i", required=True, help="Comma-separated event types")
+@click.option("--cadence", "-c", default="5m", help="Poll cadence (e.g. 5m, 30s)")
+def register(name, interests, cadence):
+    """Subscribe NAME to sentinel events."""
+    from .sentinel import register_subscriber, parse_interests, parse_cadence
+    filters = parse_interests(interests)
+    cadence_val = parse_cadence(cadence)
+    result = register_subscriber(name, filters, cadence_val)
+    if result.get("ok"):
+        click.echo(f"Registered '{name}': interests={filters}, cadence={cadence}.")
+    else:
+        click.echo(f"Error: {result.get('error', 'unknown')}", err=True)
+        raise SystemExit(1)
+
+
+@sentinel.command()
+@click.argument("name")
+def poll(name):
+    """Read and clear queued events for NAME."""
+    from .sentinel import poll_subscriber
+    events = poll_subscriber(name)
+    if not events:
+        return
+    for ev in events:
+        ts = ev.get("time", "")
+        if ts:
+            ts = ts.split("T")[-1][:8]
+        etype = ev.get("type", "?")
+        session = ev.get("session", "?")
+        detail = ev.get("detail", "")
+        click.echo(f"{ts} {etype} {session} — {detail}")
+
+
+@sentinel.command()
+@click.argument("name")
+def unregister(name):
+    """Remove subscription for NAME."""
+    from .sentinel import unregister_subscriber
+    result = unregister_subscriber(name)
+    if result.get("ok"):
+        click.echo(f"Unregistered '{name}'.")
+    else:
+        click.echo(f"Error: {result.get('error', 'unknown')}", err=True)
+        raise SystemExit(1)
 
 
 # ── watch ───────────────────────────────────────────────────────────

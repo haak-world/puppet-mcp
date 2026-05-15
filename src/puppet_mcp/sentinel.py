@@ -16,7 +16,9 @@ Env vars:
 
 import json
 import os
+import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -40,8 +42,44 @@ STATE_FILE = DATA_DIR / "sentinel-state.json"
 SUBS_FILE = DATA_DIR / "subscriptions.json"
 QUEUE_DIR = DATA_DIR / "queues"
 
+PID_FILE = DATA_DIR / "sentinel.pid"
+LOG_FILE = DATA_DIR / "sentinel.log"
+
 THRESH_WARN = 0.70
 THRESH_CRIT = 0.85
+
+# --- Interest parsing ---
+
+_ALL_EVENTS = [
+    "blocked", "unblocked", "died", "exited", "completed",
+    "new_session", "context_70", "context_85", "stale", "fleet_summary",
+]
+
+_INTEREST_MAP = {
+    "block": ["blocked", "unblocked"], "stuck": ["blocked"], "permission": ["blocked"],
+    "context": ["context_70", "context_85"], "warn": ["context_70", "context_85"],
+    "die": ["died"], "death": ["died"], "dead": ["died"],
+    "exit": ["exited"],
+    "complete": ["completed"], "completion": ["completed"], "finish": ["completed"], "done": ["completed"], "idle": ["completed"],
+    "new": ["new_session"], "spawn": ["new_session"],
+    "stale": ["stale"],
+    "all": _ALL_EVENTS, "everything": _ALL_EVENTS,
+    "fleet": ["fleet_summary"], "summary": ["fleet_summary"], "status": ["fleet_summary"],
+}
+
+
+def parse_interests(text: str) -> list[str]:
+    """Map natural language to event filter list."""
+    words = text.lower().replace(",", " ").split()
+    result: set[str] = set()
+    for w in words:
+        if w in _INTEREST_MAP:
+            result.update(_INTEREST_MAP[w])
+        elif w.rstrip("s") in _INTEREST_MAP:
+            result.update(_INTEREST_MAP[w.rstrip("s")])
+        elif w in _ALL_EVENTS:
+            result.add(w)
+    return sorted(result) if result else _ALL_EVENTS
 
 
 def load_state() -> dict:
@@ -226,6 +264,164 @@ def _check_periodic_summaries(subs: dict, curr: dict):
             Path(tmp.name).unlink(missing_ok=True)
 
 
+# --- Lifecycle functions ---
+
+def is_running() -> tuple[bool, int | None]:
+    """Check if sentinel is running via PID file. Returns (alive, pid)."""
+    if not PID_FILE.exists():
+        return False, None
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        os.kill(pid, 0)
+        return True, pid
+    except (ValueError, OSError):
+        return False, None
+
+
+def start_sentinel() -> dict:
+    """Start sentinel daemon if not running. Idempotent."""
+    alive, pid = is_running()
+    if alive:
+        return {"running": True, "pid": pid, "started": False}
+
+    exe = shutil.which("puppet-sentinel")
+    if exe:
+        cmd = [exe]
+    else:
+        cmd = [sys.executable, "-m", "puppet_mcp.sentinel"]
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    log_fh = open(LOG_FILE, "a")
+    proc = subprocess.Popen(cmd, stdout=log_fh, stderr=log_fh, start_new_session=True)
+
+    # Brief wait to verify it started
+    for _ in range(10):
+        time.sleep(0.3)
+        alive, pid = is_running()
+        if alive:
+            return {"running": True, "pid": pid, "started": True}
+
+    return {"running": False, "pid": proc.pid, "started": False}
+
+
+def stop_sentinel() -> dict:
+    """Stop sentinel daemon."""
+    alive, pid = is_running()
+    if not alive:
+        PID_FILE.unlink(missing_ok=True)
+        return {"stopped": True, "pid": None}
+    try:
+        os.kill(pid, signal.SIGTERM)
+        # Wait for exit
+        for _ in range(20):
+            time.sleep(0.1)
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                break
+    except OSError:
+        pass
+    PID_FILE.unlink(missing_ok=True)
+    return {"stopped": True, "pid": pid}
+
+
+def sentinel_status(name: str = "") -> dict:
+    """Return sentinel health + subscriber info.
+    name="" -> full fleet, name="X" -> just that subscriber.
+    """
+    alive, pid = is_running()
+    result: dict = {"running": alive, "pid": pid}
+
+    # Daemon state
+    state = load_state()
+    result["last_tick"] = state.get("timestamp")
+    result["session_count"] = len(state.get("sessions", {}))
+
+    subs = _load_subscriptions()
+
+    if name:
+        sub = subs.get(name)
+        if not sub:
+            result["subscriber"] = None
+            return result
+        queue_file = QUEUE_DIR / f"{name}.json"
+        depth = 0
+        if queue_file.exists():
+            try:
+                depth = len(json.loads(queue_file.read_text()))
+            except (json.JSONDecodeError, OSError):
+                pass
+        result["subscriber"] = {**sub, "queue_depth": depth}
+        return result
+
+    # Full fleet
+    subscribers = {}
+    for sname, sub in subs.items():
+        queue_file = QUEUE_DIR / f"{sname}.json"
+        depth = 0
+        if queue_file.exists():
+            try:
+                depth = len(json.loads(queue_file.read_text()))
+            except (json.JSONDecodeError, OSError):
+                pass
+        subscribers[sname] = {**sub, "queue_depth": depth}
+    result["subscribers"] = subscribers
+    return result
+
+
+# --- Subscription management ---
+
+def _atomic_write_json(path: Path, data):
+    """Write JSON atomically via temp + os.replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = tempfile.NamedTemporaryFile(mode="w", dir=path.parent, suffix=".tmp", delete=False)
+    try:
+        tmp.write(json.dumps(data, indent=2) + "\n")
+        tmp.close()
+        os.replace(tmp.name, path)
+    except Exception:
+        tmp.close()
+        Path(tmp.name).unlink(missing_ok=True)
+        raise
+
+
+def register_subscriber(name: str, filters: list[str], cadence: str) -> str:
+    """Register a subscriber. Returns confirmation string."""
+    subs = _load_subscriptions()
+    subs[name] = {
+        "filters": filters,
+        "cadence": cadence,
+        "registered": datetime.now(timezone.utc).isoformat(),
+    }
+    _atomic_write_json(SUBS_FILE, subs)
+    return f"registered {name}: filters={filters}, cadence={cadence}"
+
+
+def unregister_subscriber(name: str) -> str:
+    """Remove subscriber and delete queue file."""
+    subs = _load_subscriptions()
+    removed = name in subs
+    subs.pop(name, None)
+    _atomic_write_json(SUBS_FILE, subs)
+    queue_file = QUEUE_DIR / f"{name}.json"
+    queue_file.unlink(missing_ok=True)
+    return f"unregistered {name}" if removed else f"{name} not found"
+
+
+def poll_subscriber(name: str) -> list[dict]:
+    """Read and clear event queue. Returns list of events."""
+    queue_file = QUEUE_DIR / f"{name}.json"
+    if not queue_file.exists():
+        return []
+    try:
+        events = json.loads(queue_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+    if events:
+        _atomic_write_json(queue_file, [])
+    return events
+
+
 def diff_and_notify(prev_sessions: dict, curr: dict):
     """Compare states and queue events for matching subscriptions."""
     subs = _load_subscriptions()
@@ -310,51 +506,48 @@ def diff_and_notify(prev_sessions: dict, curr: dict):
     _check_periodic_summaries(subs, curr)
 
 
-def run():
+def run_loop():
+    """Main polling loop — runs until killed."""
     print(f"puppet-sentinel starting: interval={INTERVAL}s mode=subscription", flush=True)
-
     prev = load_state()
-
     while True:
         try:
             curr = snapshot()
             prev_sessions = prev.get("sessions", {})
-
             if prev_sessions:
                 diff_and_notify(prev_sessions, curr)
-
             prev = {"sessions": curr, "timestamp": datetime.now(timezone.utc).isoformat()}
             save_state(prev)
-
         except Exception as e:
             ts = datetime.now().strftime("%H:%M:%S")
             print(f"{ts} [sentinel] error: {e}", flush=True)
-
         time.sleep(INTERVAL)
 
 
-def handle_signal(signum, frame):
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"{ts} puppet-sentinel exiting (signal {signum})", flush=True)
-    sys.exit(0)
+def main():
+    """Entry point with signal handling and PID management."""
+    def _handle(signum, frame):
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"{ts} puppet-sentinel exiting (signal {signum})", flush=True)
+        sys.exit(0)
 
-
-def _write_pid():
-    pid_file = DATA_DIR / "sentinel.pid"
-    pid_file.parent.mkdir(parents=True, exist_ok=True)
-    pid_file.write_text(str(os.getpid()) + "\n")
-
-
-def _remove_pid():
-    pid_file = DATA_DIR / "sentinel.pid"
-    pid_file.unlink(missing_ok=True)
+    signal.signal(signal.SIGTERM, _handle)
+    signal.signal(signal.SIGINT, _handle)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(str(os.getpid()) + "\n")
+    try:
+        run_loop()
+    finally:
+        PID_FILE.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
-    _write_pid()
-    try:
-        run()
-    finally:
-        _remove_pid()
+    main()
+
+
+def parse_cadence(cadence: str) -> str:
+    """Public wrapper: normalize cadence string."""
+    c = cadence.strip().lower()
+    if c in ("", "immediate", "0"):
+        return "immediate"
+    return c

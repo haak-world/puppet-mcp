@@ -1,6 +1,6 @@
 """puppet MCP server — full remote control for Claude Code sessions via tmux.
 
-Tools (7):
+Tools (8):
   puppet_launch   — launch/resume/thaw/new sessions
   puppet_send     — all input: text, enter, escape, ctrl-c, slash commands
   puppet_handoff  — send prompt and wait for response (absorbs ping)
@@ -8,6 +8,7 @@ Tools (7):
   puppet_read     — raw pane output
   puppet_find     — search all sessions by metadata/content
   puppet_manage   — lifecycle: kill, freeze, restart, compact, split, accept_all
+  puppet_sentinel — sentinel daemon lifecycle and event subscription
 """
 
 import json
@@ -28,6 +29,17 @@ from .session import (
     get_claude_session_info,
     resolve_session_cwd,
     resolve_session_id,
+)
+from .sentinel import (
+    start_sentinel,
+    stop_sentinel,
+    is_running,
+    sentinel_status,
+    register_subscriber,
+    unregister_subscriber,
+    poll_subscriber,
+    parse_interests,
+    parse_cadence,
 )
 from .tmux import (
     capture_pane,
@@ -261,34 +273,115 @@ def _mcp_config_path() -> str | None:
     return None
 
 
-def _sentinel_pid_file() -> Path:
-    return data_dir() / "sentinel.pid"
-
-
 def _ensure_sentinel():
     """Start puppet-sentinel if not already running."""
-    import shutil
-    import subprocess as _sp
-    pid_file = _sentinel_pid_file()
-    if pid_file.exists():
-        try:
-            pid = int(pid_file.read_text().strip())
-            os.kill(pid, 0)
-            return
-        except (ValueError, OSError):
-            pass
-    # Find sentinel: pip-installed entry point or PATH
-    sentinel_cmd = shutil.which("puppet-sentinel")
-    if not sentinel_cmd:
-        return
-    proc = _sp.Popen(
-        [sentinel_cmd],
-        stdout=open(data_dir() / "sentinel.log", "a"),
-        stderr=_sp.STDOUT,
-        start_new_session=True,
-    )
-    pid_file.parent.mkdir(parents=True, exist_ok=True)
-    pid_file.write_text(str(proc.pid) + "\n")
+    start_sentinel()
+
+
+def _resolve_caller_name() -> str:
+    """Auto-resolve the calling agent's name for sentinel subscription.
+    1. tmux session name from _self_context()
+    2. agent field from $CLAUDE_PROJECT_DIR/.claude/settings.json
+    3. fallback "default"
+    """
+    ctx = _self_context()
+    if ctx and ctx.get("name"):
+        return ctx["name"]
+    proj = os.environ.get("CLAUDE_PROJECT_DIR", "")
+    if proj:
+        settings = Path(proj) / ".claude" / "settings.json"
+        if settings.exists():
+            try:
+                data = json.loads(settings.read_text())
+                agent = data.get("agent", "")
+                if agent:
+                    return agent
+            except (json.JSONDecodeError, OSError):
+                pass
+    return "default"
+
+
+# ── 0. puppet_sentinel ─────────────────────────────────────────────────
+
+@mcp.tool(structured_output=False)
+def puppet_sentinel(action: str = "status", name: str = "", interests: str = "", cadence: str = "5m") -> str:
+    """Sentinel daemon lifecycle and event subscription.
+
+    Daemon actions (no name needed):
+        start — start the sentinel daemon
+        stop — stop the sentinel daemon
+        restart — stop + start
+        status — daemon health, subscribers, queue depths (name optional for scoping)
+
+    Subscription actions (name auto-resolved from session context):
+        register — subscribe to events. Provide interests and cadence.
+        poll — read and clear queued events
+        unregister — remove subscription
+
+    Args:
+        action: one of start, stop, restart, status, register, poll, unregister
+        name: subscriber name (auto-resolved if empty for register/poll/unregister)
+        interests: comma-separated event types for register (e.g. "blocked,context_warning")
+        cadence: poll cadence for register (e.g. "5m", "30s")
+    """
+    if action == "start":
+        result = start_sentinel()
+        return f"Sentinel started (pid={result.get('pid', '?')})." if result.get("ok") else f"Sentinel start failed: {result.get('error', 'unknown')}"
+
+    if action == "stop":
+        result = stop_sentinel()
+        return "Sentinel stopped." if result.get("ok") else f"Sentinel stop: {result.get('error', 'not running')}"
+
+    if action == "restart":
+        stop_sentinel()
+        result = start_sentinel()
+        return f"Sentinel restarted (pid={result.get('pid', '?')})." if result.get("ok") else f"Sentinel restart failed: {result.get('error', 'unknown')}"
+
+    if action == "status":
+        info = sentinel_status(name or "")
+        lines = []
+        lines.append(f"running: {info.get('running', False)}")
+        if info.get("pid"):
+            lines.append(f"pid: {info['pid']}")
+        if info.get("uptime"):
+            lines.append(f"uptime: {info['uptime']}")
+        subs = info.get("subscribers", {})
+        if subs:
+            lines.append(f"subscribers ({len(subs)}):")
+            for sub_name, sub_info in subs.items():
+                depth = sub_info.get("queue_depth", 0)
+                lines.append(f"  {sub_name}: {depth} queued, interests={sub_info.get('interests', '?')}")
+        return "\n".join(lines)
+
+    if action == "register":
+        name = name or _resolve_caller_name()
+        filters = parse_interests(interests) if interests else []
+        cadence_val = parse_cadence(cadence)
+        result = register_subscriber(name, filters, cadence_val)
+        return f"Registered '{name}': interests={filters}, cadence={cadence}." if result.get("ok") else f"Register failed: {result.get('error', 'unknown')}"
+
+    if action == "poll":
+        name = name or _resolve_caller_name()
+        events = poll_subscriber(name)
+        if not events:
+            return ""
+        lines = []
+        for ev in events:
+            ts = ev.get("time", "")
+            if ts:
+                ts = ts.split("T")[-1][:8]  # HH:MM:SS
+            etype = ev.get("type", "?")
+            session = ev.get("session", "?")
+            detail = ev.get("detail", "")
+            lines.append(f"{ts} {etype} {session} — {detail}")
+        return "\n".join(lines)
+
+    if action == "unregister":
+        name = name or _resolve_caller_name()
+        result = unregister_subscriber(name)
+        return f"Unregistered '{name}'." if result.get("ok") else f"Unregister failed: {result.get('error', 'unknown')}"
+
+    return f"Error: unknown action '{action}'. Use start, stop, restart, status, register, poll, unregister."
 
 
 # ── 1. puppet_launch (unchanged) ────────────────────────────────────────
@@ -407,7 +500,6 @@ def puppet_launch(
     if role == "orchestrator":
         time.sleep(3)
         send_keys(name, "/loop 60s puppet_heartbeat status")
-        _ensure_sentinel()
 
     sid_note = f", session={session_id}" if session_id else " (session ID pending)"
     mode = "UNSAFE (skip-permissions)" if unsafe else "safe (permission prompts enabled)"
