@@ -19,6 +19,7 @@ puppet-mcp = "puppet_mcp.server:main"
 puppet-mcp-worker = "puppet_mcp.worker:main"
 puppet-watch = "puppet_mcp.watch:main"
 puppet-lint = "puppet_mcp.compact:lint_cli"
+puppet-sentinel = "puppet_mcp.sentinel:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/puppet_mcp"]

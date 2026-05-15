@@ -1,14 +1,13 @@
 """puppet MCP server — full remote control for Claude Code sessions via tmux.
 
-Tools (8):
-  puppet_launch    — launch/resume/thaw/new sessions
-  puppet_send      — all input: text, enter, escape, ctrl-c, slash commands
-  puppet_handoff   — send prompt and wait for response
-  puppet_status    — diff-based monitoring, full snapshot, single-session detail
-  puppet_read      — raw pane output
-  puppet_find      — search all sessions by metadata/content
-  puppet_manage    — lifecycle: kill, freeze, restart, compact, split, accept_all
-  puppet_sentinel  — event pub/sub: register, poll, unregister
+Tools (7):
+  puppet_launch   — launch/resume/thaw/new sessions
+  puppet_send     — all input: text, enter, escape, ctrl-c, slash commands
+  puppet_handoff  — send prompt and wait for response (absorbs ping)
+  puppet_status   — diff-based monitoring, full snapshot, single-session detail
+  puppet_read     — raw pane output
+  puppet_find     — search all sessions by metadata/content
+  puppet_manage   — lifecycle: kill, freeze, restart, compact, split, accept_all
 """
 
 import json
@@ -268,6 +267,7 @@ def _sentinel_pid_file() -> Path:
 
 def _ensure_sentinel():
     """Start puppet-sentinel if not already running."""
+    import shutil
     import subprocess as _sp
     pid_file = _sentinel_pid_file()
     if pid_file.exists():
@@ -277,11 +277,12 @@ def _ensure_sentinel():
             return
         except (ValueError, OSError):
             pass
-    sentinel = Path(__file__).resolve().parent.parent.parent.parent.parent / "scripts" / "puppet-sentinel"
-    if not sentinel.exists():
+    # Find sentinel: pip-installed entry point or PATH
+    sentinel_cmd = shutil.which("puppet-sentinel")
+    if not sentinel_cmd:
         return
     proc = _sp.Popen(
-        [str(sentinel)],
+        [sentinel_cmd],
         stdout=open(data_dir() / "sentinel.log", "a"),
         stderr=_sp.STDOUT,
         start_new_session=True,
@@ -404,6 +405,8 @@ def puppet_launch(
     send_keys(name, _CONTEXT_HYGIENE)
 
     if role == "orchestrator":
+        time.sleep(3)
+        send_keys(name, "/loop 60s puppet_heartbeat status")
         _ensure_sentinel()
 
     sid_note = f", session={session_id}" if session_id else " (session ID pending)"
@@ -995,165 +998,6 @@ def puppet_manage(
         return "\n".join(lines)
 
     return f"Error: unknown action '{action}'. Use kill, freeze, restart, compact, split, or accept_all."
-
-
-# ── 8. sentinel_register ──────────────────────────────────────────────
-
-_ALL_EVENTS = ['blocked', 'unblocked', 'died', 'exited', 'completed', 'new_session', 'context_70', 'context_85', 'stale']
-
-_INTEREST_MAP = {
-    'block': ['blocked', 'unblocked'],
-    'stuck': ['blocked'],
-    'permission': ['blocked'],
-    'context': ['context_70', 'context_85'],
-    'warn': ['context_70', 'context_85'],
-    'die': ['died'],
-    'death': ['died'],
-    'dead': ['died'],
-    'exit': ['exited'],
-    'complete': ['completed'],
-    'finish': ['completed'],
-    'idle': ['completed'],
-    'new': ['new_session'],
-    'spawn': ['new_session'],
-    'stale': ['stale'],
-    'all': _ALL_EVENTS,
-    'everything': _ALL_EVENTS,
-    'fleet': ['fleet_summary'],
-    'summary': ['fleet_summary'],
-    'status': ['fleet_summary'],
-}
-
-
-def _subscriptions_file() -> Path:
-    return data_dir() / "subscriptions.json"
-
-
-def _queue_dir() -> Path:
-    d = data_dir() / "queues"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def _load_subscriptions() -> dict:
-    sf = _subscriptions_file()
-    if sf.exists():
-        try:
-            return json.loads(sf.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
-
-
-def _save_subscriptions(subs: dict):
-    import tempfile
-    sf = _subscriptions_file()
-    sf.parent.mkdir(parents=True, exist_ok=True)
-    tmp = tempfile.NamedTemporaryFile(mode="w", dir=sf.parent, suffix=".tmp", delete=False)
-    try:
-        tmp.write(json.dumps(subs, indent=2) + "\n")
-        tmp.close()
-        os.replace(tmp.name, sf)
-    except Exception:
-        tmp.close()
-        Path(tmp.name).unlink(missing_ok=True)
-        raise
-
-
-def _parse_interests(text: str) -> list[str]:
-    words = text.lower().replace(",", " ").replace(";", " ").split()
-    filters = set()
-    for word in words:
-        for key, events in _INTEREST_MAP.items():
-            if key in word:
-                filters.update(events)
-    if not filters:
-        filters.update(_ALL_EVENTS)
-    return sorted(filters)
-
-
-def _parse_cadence(cadence: str) -> str:
-    c = cadence.strip().lower()
-    if c in ("", "immediate", "0"):
-        return "immediate"
-    return c
-
-
-@mcp.tool(structured_output=False)
-def puppet_sentinel(name: str, action: str = "poll", interests: str = "", cadence: str = "immediate") -> str:
-    """Sentinel event pub/sub — subscribe, poll, or unsubscribe.
-
-    The sentinel daemon monitors all tmux sessions and queues matching
-    events for registered subscribers.
-
-    Actions:
-        "register" — subscribe to events. Provide interests (natural language)
-            and optional cadence. Keywords: block/stuck, context/warn, die/dead,
-            exit, complete/idle, new/spawn, stale, fleet/status, all.
-        "poll" — read and clear queued events. Returns formatted events or "".
-        "unregister" — remove subscription and delete event queue.
-
-    Args:
-        name: subscriber identifier (e.g. "sakshi", "orchestrator")
-        action: "register", "poll", or "unregister"
-        interests: what to monitor (for register only)
-        cadence: "immediate" or duration like "5m" (for register only)
-    """
-    if action == "register":
-        filters = _parse_interests(interests or "all")
-        parsed_cadence = _parse_cadence(cadence)
-        now = datetime.now(timezone.utc).isoformat()
-        subs = _load_subscriptions()
-        subs[name] = {
-            "interests": interests or "all",
-            "filters": filters,
-            "cadence": parsed_cadence,
-            "registered_at": now,
-            "last_summary": now,
-        }
-        _save_subscriptions(subs)
-        return f"Registered: {', '.join(filters)}. Cadence: {parsed_cadence}."
-
-    elif action == "poll":
-        import tempfile
-        queue_file = _queue_dir() / f"{name}.json"
-        if not queue_file.exists():
-            return ""
-        try:
-            raw = queue_file.read_text()
-            events = json.loads(raw) if raw.strip() else []
-        except (json.JSONDecodeError, OSError):
-            events = []
-        if not events:
-            return ""
-        # Atomic clear
-        tmp = tempfile.NamedTemporaryFile(mode="w", dir=queue_file.parent, suffix=".tmp", delete=False)
-        try:
-            tmp.write("[]\n")
-            tmp.close()
-            os.replace(tmp.name, queue_file)
-        except Exception:
-            tmp.close()
-            Path(tmp.name).unlink(missing_ok=True)
-        lines = []
-        for ev in events:
-            t = ev.get("time", "")
-            ts = t[11:19] if len(t) >= 19 else t
-            etype = ev.get("type", "?").upper()
-            session = ev.get("session", "")
-            detail = ev.get("detail", "")
-            lines.append(f"{ts} {etype} {session} — {detail}" if session else f"{ts} {etype} — {detail}")
-        return "\n".join(lines)
-
-    elif action == "unregister":
-        subs = _load_subscriptions()
-        removed = name in subs
-        subs.pop(name, None)
-        _save_subscriptions(subs)
-        (_queue_dir() / f"{name}.json").unlink(missing_ok=True)
-        return "Unregistered." if removed else f"No subscription for '{name}'."
-
-    return f"Error: unknown action '{action}'. Use register, poll, or unregister."
 
 
 # ── main ────────────────────────────────────────────────────────────────
