@@ -25,35 +25,11 @@ from .tmux import (
 
 
 def _open_in_zed_terminal(session_name: str):
-    """Open a new Zed terminal and attach to the tmux session.
+    """Open a terminal attached to a tmux session via Terminal.app.
 
-    Uses Cmd+Shift+\\ keybinding (workspace::NewTerminal) for instant
-    terminal creation, then pastes the tmux attach command via clipboard.
-    Requires keybinding in ~/.config/zed/keymap.json:
-      "cmd-shift-\\\\": "workspace::NewTerminal"
+    Fast and reliable — one AppleScript call, no UI automation.
     """
-    attach_cmd = f"tmux attach -t {session_name}"
-    script = f'''
-    set the clipboard to "{attach_cmd}"
-    tell application "System Events"
-        tell process "zed"
-            set frontmost to true
-            -- Cmd+Shift+\\ = new terminal
-            key code 42 using {{command down, shift down}}
-            delay 0.4
-            -- Paste tmux attach from clipboard
-            keystroke "v" using {{command down}}
-            keystroke return
-            delay 0.3
-            -- Cmd+Shift+R = rename terminal
-            set the clipboard to "{session_name}"
-            keystroke "r" using {{command down, shift down}}
-            delay 0.2
-            keystroke "v" using {{command down}}
-            keystroke return
-        end tell
-    end tell
-    '''
+    script = f'tell application "Terminal" to do script "tmux attach -t {session_name}"'
     subprocess.Popen(["osascript", "-e", script],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
