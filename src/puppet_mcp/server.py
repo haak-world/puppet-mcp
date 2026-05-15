@@ -1,16 +1,14 @@
 """puppet MCP server — full remote control for Claude Code sessions via tmux.
 
-Tools (10):
-  puppet_launch      — launch/resume/thaw/new sessions
-  puppet_send        — all input: text, enter, escape, ctrl-c, slash commands
-  puppet_handoff     — send prompt and wait for response (absorbs ping)
-  puppet_status      — diff-based monitoring, full snapshot, single-session detail
-  puppet_read        — raw pane output
-  puppet_find        — search all sessions by metadata/content
-  puppet_manage      — lifecycle: kill, freeze, restart, compact, split, accept_all
-  sentinel_register  — subscribe to sentinel events (blocked, died, context, etc.)
-  sentinel_poll      — read and clear queued sentinel events
-  sentinel_unregister — remove a sentinel subscription
+Tools (8):
+  puppet_launch    — launch/resume/thaw/new sessions
+  puppet_send      — all input: text, enter, escape, ctrl-c, slash commands
+  puppet_handoff   — send prompt and wait for response
+  puppet_status    — diff-based monitoring, full snapshot, single-session detail
+  puppet_read      — raw pane output
+  puppet_find      — search all sessions by metadata/content
+  puppet_manage    — lifecycle: kill, freeze, restart, compact, split, accept_all
+  puppet_sentinel  — event pub/sub: register, poll, unregister
 """
 
 import json
@@ -1082,108 +1080,80 @@ def _parse_cadence(cadence: str) -> str:
 
 
 @mcp.tool(structured_output=False)
-def sentinel_register(name: str, interests: str, cadence: str = "immediate") -> str:
-    """Register for sentinel event notifications via pub/sub.
+def puppet_sentinel(name: str, action: str = "poll", interests: str = "", cadence: str = "immediate") -> str:
+    """Sentinel event pub/sub — subscribe, poll, or unsubscribe.
 
     The sentinel daemon monitors all tmux sessions and queues matching
-    events for registered subscribers. Use sentinel_poll to read events.
+    events for registered subscribers.
+
+    Actions:
+        "register" — subscribe to events. Provide interests (natural language)
+            and optional cadence. Keywords: block/stuck, context/warn, die/dead,
+            exit, complete/idle, new/spawn, stale, fleet/status, all.
+        "poll" — read and clear queued events. Returns formatted events or "".
+        "unregister" — remove subscription and delete event queue.
 
     Args:
-        name: subscriber identifier (e.g. "sakshi", "inscription-guardian")
-        interests: natural language description of what to monitor.
-            Keywords: block/stuck/permission, context/warn, die/death/dead,
-            exit, complete/finish/idle, new/spawn, stale, fleet/summary/status,
-            all/everything. Unrecognized text defaults to all events.
-        cadence: "immediate" (queue on event) or duration like "1m", "5m"
-            (also generate periodic fleet summary)
+        name: subscriber identifier (e.g. "sakshi", "orchestrator")
+        action: "register", "poll", or "unregister"
+        interests: what to monitor (for register only)
+        cadence: "immediate" or duration like "5m" (for register only)
     """
-    filters = _parse_interests(interests)
-    parsed_cadence = _parse_cadence(cadence)
-    now = datetime.now(timezone.utc).isoformat()
+    if action == "register":
+        filters = _parse_interests(interests or "all")
+        parsed_cadence = _parse_cadence(cadence)
+        now = datetime.now(timezone.utc).isoformat()
+        subs = _load_subscriptions()
+        subs[name] = {
+            "interests": interests or "all",
+            "filters": filters,
+            "cadence": parsed_cadence,
+            "registered_at": now,
+            "last_summary": now,
+        }
+        _save_subscriptions(subs)
+        return f"Registered: {', '.join(filters)}. Cadence: {parsed_cadence}."
 
-    subs = _load_subscriptions()
-    subs[name] = {
-        "interests": interests,
-        "filters": filters,
-        "cadence": parsed_cadence,
-        "registered_at": now,
-        "last_summary": now,
-    }
-    _save_subscriptions(subs)
+    elif action == "poll":
+        import tempfile
+        queue_file = _queue_dir() / f"{name}.json"
+        if not queue_file.exists():
+            return ""
+        try:
+            raw = queue_file.read_text()
+            events = json.loads(raw) if raw.strip() else []
+        except (json.JSONDecodeError, OSError):
+            events = []
+        if not events:
+            return ""
+        # Atomic clear
+        tmp = tempfile.NamedTemporaryFile(mode="w", dir=queue_file.parent, suffix=".tmp", delete=False)
+        try:
+            tmp.write("[]\n")
+            tmp.close()
+            os.replace(tmp.name, queue_file)
+        except Exception:
+            tmp.close()
+            Path(tmp.name).unlink(missing_ok=True)
+        lines = []
+        for ev in events:
+            t = ev.get("time", "")
+            ts = t[11:19] if len(t) >= 19 else t
+            etype = ev.get("type", "?").upper()
+            session = ev.get("session", "")
+            detail = ev.get("detail", "")
+            lines.append(f"{ts} {etype} {session} — {detail}" if session else f"{ts} {etype} — {detail}")
+        return "\n".join(lines)
 
-    filter_str = ", ".join(filters)
-    return f"Registered: {filter_str}. Cadence: {parsed_cadence}."
+    elif action == "unregister":
+        subs = _load_subscriptions()
+        removed = name in subs
+        subs.pop(name, None)
+        _save_subscriptions(subs)
+        (_queue_dir() / f"{name}.json").unlink(missing_ok=True)
+        return "Unregistered." if removed else f"No subscription for '{name}'."
 
-
-# ── 9. sentinel_poll ──────────────────────────────────────────────────
-
-@mcp.tool(structured_output=False)
-def sentinel_poll(name: str) -> str:
-    """Read and clear queued sentinel events for a subscriber.
-
-    Returns formatted events (one per line) or empty string if none.
-    Events are cleared after reading.
-
-    Args:
-        name: subscriber identifier (must match a sentinel_register name)
-    """
-    import tempfile
-    queue_file = _queue_dir() / f"{name}.json"
-    if not queue_file.exists():
-        return ""
-
-    # Atomic read-and-clear: read, then truncate to empty array
-    try:
-        raw = queue_file.read_text()
-        events = json.loads(raw) if raw.strip() else []
-    except (json.JSONDecodeError, OSError):
-        events = []
-
-    if not events:
-        return ""
-
-    # Clear by atomic write of empty array
-    tmp = tempfile.NamedTemporaryFile(mode="w", dir=queue_file.parent, suffix=".tmp", delete=False)
-    try:
-        tmp.write("[]\n")
-        tmp.close()
-        os.replace(tmp.name, queue_file)
-    except Exception:
-        tmp.close()
-        Path(tmp.name).unlink(missing_ok=True)
-
-    lines = []
-    for ev in events:
-        t = ev.get("time", "")
-        ts = t[11:19] if len(t) >= 19 else t
-        etype = ev.get("type", "?").upper()
-        session = ev.get("session", "")
-        detail = ev.get("detail", "")
-        if session:
-            lines.append(f"{ts} {etype} {session} — {detail}")
-        else:
-            lines.append(f"{ts} {etype} — {detail}")
-    return "\n".join(lines)
-
-
-# ── 10. sentinel_unregister ───────────────────────────────────────────
-
-@mcp.tool(structured_output=False)
-def sentinel_unregister(name: str) -> str:
-    """Remove a sentinel subscription and delete its event queue.
-
-    Args:
-        name: subscriber identifier to remove
-    """
-    subs = _load_subscriptions()
-    removed = name in subs
-    subs.pop(name, None)
-    _save_subscriptions(subs)
-
-    queue_file = _queue_dir() / f"{name}.json"
-    queue_file.unlink(missing_ok=True)
-
-    return "Unregistered." if removed else f"No subscription found for '{name}'."
+    return f"Error: unknown action '{action}'. Use register, poll, or unregister."
 
 
 # ── main ────────────────────────────────────────────────────────────────
