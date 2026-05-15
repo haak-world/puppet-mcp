@@ -6,6 +6,8 @@ import time
 from collections import defaultdict
 
 from .session import SessionMap
+import subprocess
+
 from .tmux import (
     capture_pane,
     classify_activity,
@@ -20,6 +22,41 @@ from .tmux import (
     send_keys,
     session_exists,
 )
+
+
+def _open_in_zed_terminal(session_name: str):
+    """Open a new Zed terminal and attach to the tmux session.
+
+    Uses AppleScript to: open command palette → new terminal →
+    type tmux attach command → rename terminal.
+    """
+    attach_cmd = f"tmux attach -t {session_name}"
+    script = f'''
+    tell application "System Events"
+        tell process "zed"
+            set frontmost to true
+            keystroke "p" using {{command down, shift down}}
+            delay 0.3
+            keystroke "workspace: new terminal"
+            delay 0.5
+            keystroke return
+            delay 0.8
+            keystroke "{attach_cmd}"
+            keystroke return
+            delay 0.3
+            keystroke "p" using {{command down, shift down}}
+            delay 0.3
+            keystroke "terminal: rename"
+            delay 0.5
+            keystroke return
+            delay 0.3
+            keystroke "{session_name}"
+            keystroke return
+        end tell
+    end tell
+    '''
+    subprocess.Popen(["osascript", "-e", script],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 SPINNER = "⣾⣽⣻⢿⡿⣟⣯⣷"
 VBAR = " ▁▂▃▄▅▆▇█"
@@ -303,7 +340,7 @@ def _watch_interactive(stdscr, interval: int = 5):
                     send_keys(s["name"], f"cd {cwd} && claude --resume {entry['session_id']}")
                     smap.thaw(s["name"])
                 # Open in a new tmux window — watch keeps running
-                run_tmux(["new-window", "-n", s["name"], f"tmux attach -t {s['name']}"])
+                _open_in_zed_terminal(s["name"])
                 message = f"Opened '{s['name']}' in new window"
                 message_until = now + 3
                 last_poll = 0
@@ -314,12 +351,12 @@ def _watch_interactive(stdscr, interval: int = 5):
                     send_keys(s["name"], f"claude --resume {entry['session_id']}")
                 else:
                     send_keys(s["name"], "claude --resume")
-                run_tmux(["new-window", "-n", s["name"], f"tmux attach -t {s['name']}"])
+                _open_in_zed_terminal(s["name"])
                 message = f"Resuming '{s['name']}' in new window"
                 message_until = now + 3
                 last_poll = 0
             elif session_exists(s["name"]):
-                run_tmux(["new-window", "-n", s["name"], f"tmux attach -t {s['name']}"])
+                _open_in_zed_terminal(s["name"])
                 message = f"Opened '{s['name']}' in new window"
                 message_until = now + 3
         elif key == ord('f'):
