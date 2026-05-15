@@ -25,32 +25,38 @@ from .tmux import (
 
 
 def _open_in_zed_terminal(session_name: str):
-    """Open a new Zed terminal and attach to the tmux session.
+    """Open a new Zed terminal attached to a tmux session.
 
-    Uses AppleScript to: open command palette → new terminal →
-    type tmux attach command → rename terminal.
+    Uses AppleScript with clipboard paste (instant) instead of
+    keystroke typing (slow, visible). Minimal delays.
     """
     attach_cmd = f"tmux attach -t {session_name}"
+    # Use clipboard for instant paste instead of slow keystroke typing
     script = f'''
     tell application "System Events"
         tell process "zed"
             set frontmost to true
+            -- New terminal via command palette (short fuzzy match)
             keystroke "p" using {{command down, shift down}}
+            delay 0.2
+            keystroke "new term"
             delay 0.3
-            keystroke "workspace: new terminal"
+            keystroke return
             delay 0.5
+            -- Paste tmux attach command via clipboard (instant, no visible typing)
+            set the clipboard to "{attach_cmd}"
+            keystroke "v" using {{command down}}
             keystroke return
-            delay 0.8
-            keystroke "{attach_cmd}"
-            keystroke return
-            delay 0.3
+            delay 0.2
+            -- Rename terminal
             keystroke "p" using {{command down, shift down}}
+            delay 0.2
+            keystroke "term renam"
             delay 0.3
-            keystroke "terminal: rename"
-            delay 0.5
             keystroke return
-            delay 0.3
-            keystroke "{session_name}"
+            delay 0.2
+            set the clipboard to "{session_name}"
+            keystroke "v" using {{command down}}
             keystroke return
         end tell
     end tell
