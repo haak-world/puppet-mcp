@@ -86,7 +86,8 @@ def puppet_send(name: str, text: str = "", action: str = "text", from_agent: str
         return f"Sent '{cmd}' to '{name}'."
 
     if action == "report":
-        if not from_agent:
+        from_agent = from_agent or _resolve_caller_name()
+        if not from_agent or from_agent == "default":
             return "Error: from_agent required for report."
         # Deliver report to assigner's session
         if session_exists(name):
@@ -111,14 +112,12 @@ def puppet_send(name: str, text: str = "", action: str = "text", from_agent: str
         return f"Report delivered to '{name}'."
 
     # action == "text" (default)
-    if from_agent:
-        send_keys(name, f"[{from_agent}→{name}]: {text}")
-        log = _message_log()
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        with open(log, "a") as f:
-            f.write(f"{ts} {from_agent}→{name}: {text}\n")
-    else:
-        send_keys(name, text)
+    from_agent = from_agent or _resolve_caller_name()
+    send_keys(name, f"[{from_agent}→{name}]: {text}")
+    log = _message_log()
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with open(log, "a") as f:
+        f.write(f"{ts} {from_agent}→{name}: {text}\n")
     return f"Sent to '{name}'."
 
 
