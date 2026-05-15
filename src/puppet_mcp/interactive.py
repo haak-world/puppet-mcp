@@ -15,7 +15,9 @@ from .tmux import (
     kill_session,
     list_sessions,
     parse_status_bar,
+    run_tmux,
     send_key,
+    send_keys,
     session_exists,
 )
 
