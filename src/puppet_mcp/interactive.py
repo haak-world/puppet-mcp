@@ -25,11 +25,27 @@ from .tmux import (
 
 
 def _open_in_zed_terminal(session_name: str):
-    """Open a terminal attached to a tmux session via Terminal.app.
+    """Open a new Zed terminal and attach to the tmux session.
 
-    Fast and reliable — one AppleScript call, no UI automation.
+    Uses command palette approach — slower but reliable.
     """
-    script = f'tell application "Terminal" to do script "tmux attach -t {session_name}"'
+    attach_cmd = f"tmux attach -t {session_name}"
+    script = f'''
+    tell application "System Events"
+        tell process "zed"
+            set frontmost to true
+            keystroke "p" using {{command down, shift down}}
+            delay 0.3
+            keystroke "workspace: new terminal"
+            delay 0.5
+            keystroke return
+            delay 0.8
+            set the clipboard to "{attach_cmd}"
+            keystroke "v" using {{command down}}
+            keystroke return
+        end tell
+    end tell
+    '''
     subprocess.Popen(["osascript", "-e", script],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
