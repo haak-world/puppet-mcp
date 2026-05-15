@@ -57,12 +57,13 @@ def puppet_send(name: str, text: str = "", action: str = "text", from_agent: str
       "escape" — send Escape (interrupt current generation).
       "ctrl-c" — send Ctrl+C (cancel current operation).
       "slash"  — send text as a slash command (prepends / if missing).
+      "report" — completion report for a puppet_assign task.
 
     Args:
-        name: tmux session name
-        text: text to send (required for "text" and "slash" actions)
-        action: one of "text", "enter", "escape", "ctrl-c", "slash"
-        from_agent: caller identity for "text" action (e.g. "orchestrator")
+        name: tmux session name (for report: the assigner to report TO)
+        text: text to send (required for "text", "slash", and "report")
+        action: one of "text", "enter", "escape", "ctrl-c", "slash", "report"
+        from_agent: caller identity (for report: who is reporting)
     """
     if not session_exists(name):
         return f"Error: tmux session '{name}' does not exist."
@@ -83,6 +84,31 @@ def puppet_send(name: str, text: str = "", action: str = "text", from_agent: str
         cmd = text if text.startswith("/") else f"/{text}"
         send_keys(name, cmd)
         return f"Sent '{cmd}' to '{name}'."
+
+    if action == "report":
+        if not from_agent:
+            return "Error: from_agent required for report."
+        # Deliver report to assigner's session
+        if session_exists(name):
+            send_keys(name, f"[REPORT from {from_agent}]: {text}")
+        # Update assignments file
+        af = data_dir() / "assignments.json"
+        if af.exists():
+            try:
+                assignments = json.loads(af.read_text())
+                for a in assignments.values():
+                    if a.get("session") == from_agent and a.get("from") == name and a.get("status") == "pending":
+                        a["status"] = "completed"
+                        a["report"] = text[:500]
+                        a["completed_at"] = datetime.now(timezone.utc).isoformat()
+                af.write_text(json.dumps(assignments, indent=2) + "\n")
+            except (json.JSONDecodeError, OSError):
+                pass
+        log = _message_log()
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with open(log, "a") as f:
+            f.write(f"{ts} REPORT {from_agent}→{name}: {text[:200]}\n")
+        return f"Report delivered to '{name}'."
 
     # action == "text" (default)
     if from_agent:

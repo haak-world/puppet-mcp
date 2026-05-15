@@ -66,9 +66,9 @@ def cli():
     \b
     5 commands:
       launch NAME    get into a session (create/resume/thaw/attach)
-      send NAME      talk to a session (text, keys, slash commands)
+      send NAME      post to a session (fire-and-forget)
+      assign NAME    send work with completion tracking (agent reports back)
       manage NAME    lifecycle (kill, freeze, restart, compact, etc.)
-      sentinel ...   sentinel daemon lifecycle and event subscription
       watch          live interactive dashboard
     """
 
@@ -255,6 +255,61 @@ def send(name, text, action, from_agent, wait, timeout):
             return
 
         click.echo(f"Sent to '{name}'.")
+
+
+# ── assign ──────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("name")
+@click.argument("task")
+@click.option("--from", "from_agent", default="orchestrator", help="Who is assigning")
+def assign(name, task, from_agent):
+    """Assign work to a session with completion tracking.
+
+    The agent receives the task with an instruction to report back
+    when done via puppet_send(action="report"). The sentinel monitors
+    for failures (died, blocked, context wall).
+
+    \b
+    Examples:
+      puppet assign worker-1 "Fix the auth tests"
+      puppet assign reed "Review the PR" --from sakshi
+    """
+    if not session_exists(name):
+        click.echo(f"Error: session '{name}' does not exist.", err=True)
+        raise SystemExit(1)
+
+    # Record assignment
+    af = data_dir() / "assignments.json"
+    af.parent.mkdir(parents=True, exist_ok=True)
+    assignments = {}
+    if af.exists():
+        try:
+            assignments = json.loads(af.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    import time as _t
+    aid = f"{name}:{int(_t.time())}"
+    from datetime import datetime, timezone
+    assignments[aid] = {
+        "session": name,
+        "from": from_agent,
+        "task": task[:200],
+        "assigned_at": datetime.now(timezone.utc).isoformat(),
+        "status": "pending",
+    }
+    af.write_text(json.dumps(assignments, indent=2) + "\n")
+
+    # Send with report-back instruction
+    msg = (
+        f"[{from_agent}→{name}]: {task}\n\n"
+        f"When you complete this task, report back by calling: "
+        f'puppet_send(name="{from_agent}", text="your summary", action="report", from_agent="{name}")'
+    )
+    send_keys(name, msg)
+
+    _log_message(f"ASSIGN {from_agent}→{name}: {task[:100]}")
+    click.echo(f"Assigned to '{name}': {task[:80]}")
 
 
 # ── manage ──────────────────────────────────────────────────────────
@@ -456,10 +511,11 @@ def start():
     """Start the sentinel daemon."""
     from .sentinel import start_sentinel
     result = start_sentinel()
-    if result.get("ok"):
-        click.echo(f"Sentinel started (pid={result.get('pid', '?')}).")
+    if result.get("running"):
+        verb = "started" if result.get("started") else "already running"
+        click.echo(f"Sentinel {verb} (pid={result.get('pid', '?')}).")
     else:
-        click.echo(f"Error: {result.get('error', 'unknown')}", err=True)
+        click.echo(f"Error: sentinel failed to start (pid={result.get('pid', '?')})", err=True)
         raise SystemExit(1)
 
 
@@ -468,7 +524,7 @@ def stop():
     """Stop the sentinel daemon."""
     from .sentinel import stop_sentinel
     result = stop_sentinel()
-    if result.get("ok"):
+    if result.get("stopped"):
         click.echo("Sentinel stopped.")
     else:
         click.echo(f"Error: {result.get('error', 'not running')}", err=True)
@@ -481,10 +537,10 @@ def restart():
     from .sentinel import stop_sentinel, start_sentinel
     stop_sentinel()
     result = start_sentinel()
-    if result.get("ok"):
+    if result.get("running"):
         click.echo(f"Sentinel restarted (pid={result.get('pid', '?')}).")
     else:
-        click.echo(f"Error: {result.get('error', 'unknown')}", err=True)
+        click.echo(f"Error: sentinel failed to start", err=True)
         raise SystemExit(1)
 
 
@@ -516,12 +572,8 @@ def register(name, interests, cadence):
     from .sentinel import register_subscriber, parse_interests, parse_cadence
     filters = parse_interests(interests)
     cadence_val = parse_cadence(cadence)
-    result = register_subscriber(name, filters, cadence_val)
-    if result.get("ok"):
-        click.echo(f"Registered '{name}': interests={filters}, cadence={cadence}.")
-    else:
-        click.echo(f"Error: {result.get('error', 'unknown')}", err=True)
-        raise SystemExit(1)
+    msg = register_subscriber(name, filters, cadence_val)
+    click.echo(msg)
 
 
 @sentinel.command()
@@ -547,12 +599,8 @@ def poll(name):
 def unregister(name):
     """Remove subscription for NAME."""
     from .sentinel import unregister_subscriber
-    result = unregister_subscriber(name)
-    if result.get("ok"):
-        click.echo(f"Unregistered '{name}'.")
-    else:
-        click.echo(f"Error: {result.get('error', 'unknown')}", err=True)
-        raise SystemExit(1)
+    msg = unregister_subscriber(name)
+    click.echo(msg)
 
 
 # ── watch ───────────────────────────────────────────────────────────

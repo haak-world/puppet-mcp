@@ -2,13 +2,13 @@
 
 Tools (8):
   puppet_launch   — launch/resume/thaw/new sessions
-  puppet_send     — all input: text, enter, escape, ctrl-c, slash commands
-  puppet_handoff  — send prompt and wait for response (absorbs ping)
+  puppet_send     — input: text, enter, escape, ctrl-c, slash, report
+  puppet_assign   — send work with completion tracking (agent reports back)
   puppet_status   — diff-based monitoring, full snapshot, single-session detail
   puppet_read     — raw pane output
   puppet_find     — search all sessions by metadata/content
   puppet_manage   — lifecycle: kill, freeze, restart, compact, split, accept_all
-  puppet_sentinel — sentinel daemon lifecycle and event subscription
+  puppet_sentinel — event pub/sub: register, poll, unregister
 """
 
 import json
@@ -522,13 +522,15 @@ def puppet_send(name: str, text: str = "", action: str = "text", from_agent: str
       "escape" — send Escape (interrupt current generation).
       "ctrl-c" — send Ctrl+C (cancel current operation).
       "slash"  — send text as a slash command (prepends / if missing).
-                 Examples: "status", "/model sonnet", "compact".
+      "report" — completion report for a puppet_assign task. Delivers the
+                 report to the assigner's session, marks the assignment
+                 as completed, and logs it.
 
     Args:
-        name: tmux session name
-        text: text to send (required for "text" and "slash" actions)
-        action: one of "text", "enter", "escape", "ctrl-c", "slash"
-        from_agent: caller identity for "text" action (e.g. "orchestrator")
+        name: tmux session name (for report: the assigner to report TO)
+        text: text to send (required for "text", "slash", and "report")
+        action: one of "text", "enter", "escape", "ctrl-c", "slash", "report"
+        from_agent: caller identity (e.g. "orchestrator", or worker name for reports)
     """
     if not session_exists(name):
         return f"Error: tmux session '{name}' does not exist."
@@ -550,6 +552,28 @@ def puppet_send(name: str, text: str = "", action: str = "text", from_agent: str
         send_keys(name, cmd)
         return f"Sent '{cmd}' to '{name}'."
 
+    if action == "report":
+        # Completion report: deliver to assigner + mark assignment completed
+        if not from_agent:
+            return "Error: from_agent required for report (who is reporting?)."
+        # Deliver to the target session
+        if session_exists(name):
+            send_keys(name, f"[REPORT from {from_agent}]: {text}")
+        # Mark matching assignments as completed
+        assignments = _load_assignments()
+        for aid, a in assignments.items():
+            if a.get("session") == from_agent and a.get("from") == name and a.get("status") == "pending":
+                a["status"] = "completed"
+                a["report"] = text[:500]
+                a["completed_at"] = datetime.now(timezone.utc).isoformat()
+        _save_assignments(assignments)
+        # Log
+        log = _message_log()
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with open(log, "a") as f:
+            f.write(f"{ts} REPORT {from_agent}→{name}: {text[:200]}\n")
+        return f"Report delivered to '{name}' from '{from_agent}'."
+
     # action == "text" (default)
     if from_agent:
         send_keys(name, f"[{from_agent}→{name}]: {text}")
@@ -562,82 +586,76 @@ def puppet_send(name: str, text: str = "", action: str = "text", from_agent: str
     return f"Sent to '{name}'."
 
 
-# ── 3. puppet_handoff ───────────────────────────────────────────────────
+# ── 3. puppet_assign ───────────────────────────────────────────────────
+
+def _assignments_file() -> Path:
+    return data_dir() / "assignments.json"
+
+
+def _load_assignments() -> dict:
+    af = _assignments_file()
+    if af.exists():
+        try:
+            return json.loads(af.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _save_assignments(data: dict):
+    af = _assignments_file()
+    af.parent.mkdir(parents=True, exist_ok=True)
+    af.write_text(json.dumps(data, indent=2) + "\n")
+
 
 @mcp.tool(structured_output=False)
-def puppet_handoff(
-    name: str,
-    prompt: str = "",
-    from_agent: str = "",
-    timeout: int = 120,
-) -> str:
-    """Send a prompt and wait for the response. Round-trip in one call.
+def puppet_assign(name: str, task: str, from_agent: str = "orchestrator") -> str:
+    """Assign work to a session with completion tracking.
 
-    If prompt is empty or a status-check pattern (e.g. "status", "ping"),
-    behaves like a quick ping with a shorter default timeout (30s).
+    Sends the task with an instruction for the agent to report back
+    when done. The agent reports by calling puppet_send with action="report".
+    The sentinel monitors for failure cases (died, blocked, context wall).
 
-    Waits for the session to be idle (if currently working), sends the
-    prompt, then polls every 2 seconds until the agent finishes and
-    returns to idle. Returns only the new output.
+    Unlike puppet_send (fire-and-forget), puppet_assign tracks:
+    - Who assigned what to whom
+    - Whether the agent reported completion
+    - Failure detection via sentinel
 
     Args:
-        name: tmux session name
-        prompt: text to send. Empty or status-like = ping mode (30s timeout).
-        from_agent: caller identity. Empty = no prefix (human-style).
-        timeout: max seconds to wait for response (default 120)
+        name: tmux session name to assign work to
+        task: description of the work to do
+        from_agent: who is assigning (default "orchestrator")
     """
     if not session_exists(name):
         return f"Error: tmux session '{name}' does not exist."
 
-    # Ping mode: empty prompt or status-check pattern
-    ping_patterns = {"", "status", "ping", "what is your status?"}
-    is_ping = prompt.strip().lower() in ping_patterns
-    if is_ping:
-        prompt = prompt or "What is your status? What have you produced so far? What are you blocked on?"
-        from_agent = from_agent or "orchestrator"
-        timeout = min(timeout, 30) if timeout == 120 else timeout
+    # Record the assignment
+    assignments = _load_assignments()
+    assignment_id = f"{name}:{int(time.time())}"
+    assignments[assignment_id] = {
+        "session": name,
+        "from": from_agent,
+        "task": task[:200],
+        "assigned_at": datetime.now(timezone.utc).isoformat(),
+        "status": "pending",
+    }
+    _save_assignments(assignments)
 
-    # Wait for idle before sending (up to timeout/2)
-    wait_budget = timeout // 2
-    elapsed = 0
-    while not is_idle(capture_pane(name, 5)) and elapsed < wait_budget:
-        time.sleep(2)
-        elapsed += 2
-    if not is_idle(capture_pane(name, 5)):
-        if is_ping:
-            return f"Session '{name}' is working — cannot ping. Wait until idle."
-        return f"Error: '{name}' still working after {elapsed}s — cannot send prompt."
-
-    # Snapshot content before sending
-    before = set(content_lines(capture_pane(name, 50), 50))
-
-    # Send prompt
-    msg = f"[{from_agent}→{name}]: {prompt}" if from_agent else prompt
+    # Send the task with report-back instruction
+    msg = (
+        f"[{from_agent}→{name}]: {task}\n\n"
+        f"When you complete this task, report back by calling: "
+        f"puppet_send(name=\"{from_agent}\", text=\"your summary of what you did and produced\", action=\"report\", from_agent=\"{name}\")"
+    )
     send_keys(name, msg)
 
-    # Poll for completion
-    time.sleep(2)
-    elapsed = 2
-    while elapsed < timeout:
-        pane = capture_pane(name, 50)
-        if is_idle(pane):
-            after = content_lines(pane, 50)
-            new_lines = [l for l in after if l not in before]
-            if new_lines and (prompt in new_lines[0] or (from_agent and from_agent in new_lines[0])):
-                new_lines = new_lines[1:]
-            response = "\n".join(new_lines)
-            return response if response else "(empty response)"
-        time.sleep(2)
-        elapsed += 2
+    # Log
+    log = _message_log()
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with open(log, "a") as f:
+        f.write(f"{ts} ASSIGN {from_agent}→{name}: {task[:100]}\n")
 
-    # Timeout
-    pane = capture_pane(name, 50)
-    after = content_lines(pane, 50)
-    new_lines = [l for l in after if l not in before]
-    if new_lines and (prompt in new_lines[0] or (from_agent and from_agent in new_lines[0])):
-        new_lines = new_lines[1:]
-    response = "\n".join(new_lines)
-    return f"[timeout after {timeout}s — partial response]\n{response}"
+    return f"Assigned to '{name}': {task[:80]}. Agent will report back via puppet_send(action='report')."
 
 
 # ── 4. puppet_status ────────────────────────────────────────────────────
