@@ -296,25 +296,30 @@ def _watch_interactive(stdscr, interval: int = 5):
                 entry = smap.get(s["name"])
                 if entry:
                     cwd = entry.get("cwd", os.getcwd())
-                    create_session(s["name"], f"cd {cwd} && claude --resume {entry['session_id']}")
+                    create_session(s["name"])
+                    time.sleep(0.5)
+                    send_keys(s["name"], f"cd {cwd} && claude --resume {entry['session_id']}")
                     smap.thaw(s["name"])
-                    time.sleep(1)
-                curses.endwin()
-                os.execlp("tmux", "tmux", "attach", "-t", s["name"])
+                # Open in a new tmux window — watch keeps running
+                run_tmux(["new-window", "-n", s["name"], f"tmux attach -t {s['name']}"])
+                message = f"Opened '{s['name']}' in new window"
+                message_until = now + 3
+                last_poll = 0
             elif s["activity"] == "exited":
-                # Claude exited but shell is alive — resume inside existing tmux
+                # Claude exited — resume inside the existing shell
                 entry = smap.get(s["name"])
                 if entry and entry.get("session_id"):
                     send_keys(s["name"], f"claude --resume {entry['session_id']}")
                 else:
-                    # No session ID known — open claude's interactive resume picker
                     send_keys(s["name"], "claude --resume")
-                time.sleep(1)
-                curses.endwin()
-                os.execlp("tmux", "tmux", "attach", "-t", s["name"])
+                run_tmux(["new-window", "-n", s["name"], f"tmux attach -t {s['name']}"])
+                message = f"Resuming '{s['name']}' in new window"
+                message_until = now + 3
+                last_poll = 0
             elif session_exists(s["name"]):
-                curses.endwin()
-                os.execlp("tmux", "tmux", "attach", "-t", s["name"])
+                run_tmux(["new-window", "-n", s["name"], f"tmux attach -t {s['name']}"])
+                message = f"Opened '{s['name']}' in new window"
+                message_until = now + 3
         elif key == ord('f'):
             s = sessions[selected]
             if s["activity"] not in ("frozen", "dead"):
