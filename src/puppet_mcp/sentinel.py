@@ -246,9 +246,14 @@ def _check_periodic_summaries(subs: dict, curr: dict):
 
         if elapsed >= interval:
             summary = _generate_fleet_summary(curr)
+            if summary == sub.get("last_summary_text", ""):
+                sub["last_summary"] = now_iso
+                updated = True
+                continue
             event = {"time": now_iso, "type": "fleet_summary", "session": "", "detail": summary}
             _queue_event(name, event)
             sub["last_summary"] = now_iso
+            sub["last_summary_text"] = summary
             updated = True
 
     if updated:
