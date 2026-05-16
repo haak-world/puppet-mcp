@@ -898,7 +898,7 @@ def puppet_manage(
 
     Args:
         name: tmux session name (required for all actions except accept_all)
-        action: one of "kill", "freeze", "restart", "compact", "split", "accept_all"
+        action: one of "kill", "freeze", "restart", "compact", "split", "accept_all", "rename"
         topics: list of topic labels for "split" action
         summary: optional summary note for "compact" action
         force: override safety checks for "kill" and "restart"
@@ -1106,7 +1106,28 @@ def puppet_manage(
             lines.append(f"\nSuggested additional topics: {', '.join(suggestions)}")
         return "\n".join(lines)
 
-    return f"Error: unknown action '{action}'. Use kill, freeze, restart, compact, split, or accept_all."
+    # ── rename ──
+    if action == "rename":
+        if not name or not summary:
+            return "Error: rename requires name (old) and summary (new name)."
+        old_name = name
+        new_name = summary  # repurpose summary param as new_name
+        if not session_exists(old_name):
+            return f"Error: tmux session '{old_name}' does not exist."
+        if session_exists(new_name):
+            return f"Error: tmux session '{new_name}' already exists."
+        result = run_tmux(["rename-session", "-t", old_name, new_name])
+        if result.returncode != 0:
+            return f"Error renaming: {result.stderr.strip()}"
+        # Update session map
+        entry = _session_map.get(old_name)
+        if entry:
+            _session_map.remove(old_name)
+            _session_map.record(new_name, entry.get("session_id", ""), entry.get("agent", ""),
+                                entry.get("cwd", ""), parent=entry.get("parent", ""), role=entry.get("role", ""))
+        return f"Renamed '{old_name}' → '{new_name}'."
+
+    return f"Error: unknown action '{action}'. Use kill, freeze, restart, compact, split, accept_all, or rename."
 
 
 # ── main ────────────────────────────────────────────────────────────────

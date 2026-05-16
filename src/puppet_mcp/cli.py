@@ -257,6 +257,32 @@ def send(name, text, action, from_agent, wait, timeout):
         click.echo(f"Sent to '{name}'.")
 
 
+# ── rename ──────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("old_name")
+@click.argument("new_name")
+def rename(old_name, new_name):
+    """Rename a tmux session and update the session map."""
+    if not session_exists(old_name):
+        click.echo(f"Error: session '{old_name}' does not exist.", err=True)
+        raise SystemExit(1)
+    if session_exists(new_name):
+        click.echo(f"Error: session '{new_name}' already exists.", err=True)
+        raise SystemExit(1)
+    result = run_tmux(["rename-session", "-t", old_name, new_name])
+    if result.returncode != 0:
+        click.echo(f"Error: {result.stderr.strip()}", err=True)
+        raise SystemExit(1)
+    smap = _session_map()
+    entry = smap.get(old_name)
+    if entry:
+        smap.remove(old_name)
+        smap.record(new_name, entry.get("session_id", ""), entry.get("agent", ""),
+                    entry.get("cwd", ""), parent=entry.get("parent", ""), role=entry.get("role", ""))
+    click.echo(f"Renamed '{old_name}' → '{new_name}'.")
+
+
 # ── assign ──────────────────────────────────────────────────────────
 
 @cli.command()
