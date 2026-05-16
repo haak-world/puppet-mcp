@@ -144,8 +144,12 @@ def _load_subscriptions() -> dict:
     return {}
 
 
+MAX_QUEUE_SIZE = 100
+STALE_SUBSCRIBER_HOURS = 1
+
+
 def _queue_event(subscriber: str, event: dict):
-    """Append an event to a subscriber's queue file atomically."""
+    """Append an event to a subscriber's queue file atomically. Caps at MAX_QUEUE_SIZE."""
     QUEUE_DIR.mkdir(parents=True, exist_ok=True)
     queue_file = QUEUE_DIR / f"{subscriber}.json"
 
@@ -157,6 +161,9 @@ def _queue_event(subscriber: str, event: dict):
             existing = []
 
     existing.append(event)
+    # Cap: keep only the most recent events
+    if len(existing) > MAX_QUEUE_SIZE:
+        existing = existing[-MAX_QUEUE_SIZE:]
 
     tmp = tempfile.NamedTemporaryFile(mode="w", dir=QUEUE_DIR, suffix=".tmp", delete=False)
     try:
@@ -166,6 +173,59 @@ def _queue_event(subscriber: str, event: dict):
     except Exception:
         tmp.close()
         Path(tmp.name).unlink(missing_ok=True)
+
+
+def _cleanup_queues():
+    """Remove stale subscriber queues and subscriptions.
+
+    A subscriber is stale if:
+    - Queue has >50 events and oldest is >1 hour old (never polled)
+    - Subscription registered >24h ago with no poll (queue file untouched)
+    """
+    if not QUEUE_DIR.exists():
+        return
+
+    now = datetime.now(timezone.utc)
+    subs = _load_subscriptions()
+    stale = []
+
+    for queue_file in QUEUE_DIR.glob("*.json"):
+        name = queue_file.stem
+        if name.endswith(".tmp"):
+            continue
+
+        try:
+            events = json.loads(queue_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            events = []
+
+        if len(events) < 50:
+            continue
+
+        # Check age of oldest event
+        oldest = events[0].get("time", "") if events else ""
+        if not oldest:
+            continue
+        try:
+            oldest_dt = datetime.fromisoformat(oldest.replace("Z", "+00:00"))
+            age_hours = (now - oldest_dt).total_seconds() / 3600
+        except (ValueError, TypeError):
+            continue
+
+        if age_hours > STALE_SUBSCRIBER_HOURS:
+            stale.append(name)
+
+    # Remove stale queues and subscriptions
+    for name in stale:
+        queue_file = QUEUE_DIR / f"{name}.json"
+        queue_file.unlink(missing_ok=True)
+        if name in subs:
+            del subs[name]
+            ts = datetime.now().strftime("%H:%M:%S")
+            print(f"{ts} [sentinel] pruned stale subscriber: {name}", flush=True)
+
+    if stale and subs is not None:
+        _atomic_write_json(SUBS_FILE, subs)
 
 
 def _dispatch_event(subs: dict, event_type: str, session: str, detail: str):
@@ -494,6 +554,7 @@ def run_loop():
     """Main polling loop — runs until killed."""
     print(f"puppet-sentinel starting: interval={INTERVAL}s mode=subscription", flush=True)
     prev = load_state()
+    cleanup_counter = 0
     while True:
         try:
             curr = snapshot()
@@ -502,6 +563,12 @@ def run_loop():
                 diff_and_notify(prev_sessions, curr)
             prev = {"sessions": curr, "timestamp": datetime.now(timezone.utc).isoformat()}
             save_state(prev)
+
+            # Cleanup stale queues every ~60 ticks (~30 min at 30s interval)
+            cleanup_counter += 1
+            if cleanup_counter >= 60:
+                _cleanup_queues()
+                cleanup_counter = 0
         except Exception as e:
             ts = datetime.now().strftime("%H:%M:%S")
             print(f"{ts} [sentinel] error: {e}", flush=True)
