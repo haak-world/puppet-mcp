@@ -1111,7 +1111,25 @@ def puppet_manage(
 
 # ── main ────────────────────────────────────────────────────────────────
 
+WORKER_TOOLS = {"puppet_send", "puppet_status", "puppet_read", "puppet_find"}
+
+
 def main():
+    import sys
+
+    role = os.environ.get("PUPPET_ROLE", "")
+    if "--role" in sys.argv:
+        idx = sys.argv.index("--role")
+        if idx + 1 < len(sys.argv):
+            role = sys.argv[idx + 1]
+
+    if role == "worker":
+        # Remove orchestrator-only tools
+        all_tools = list(mcp._tool_manager._tools.keys())
+        for name in all_tools:
+            if name not in WORKER_TOOLS:
+                del mcp._tool_manager._tools[name]
+
     mcp.run()
 
 

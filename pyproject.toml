@@ -16,7 +16,6 @@ split = ["anthropic>=0.30"]
 [project.scripts]
 puppet = "puppet_mcp.cli:cli"
 puppet-mcp = "puppet_mcp.server:main"
-puppet-mcp-worker = "puppet_mcp.worker:main"
 puppet-watch = "puppet_mcp.watch:main"
 puppet-lint = "puppet_mcp.compact:lint_cli"
 puppet-sentinel = "puppet_mcp.sentinel:main"
